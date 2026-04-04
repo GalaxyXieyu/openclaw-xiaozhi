@@ -40,15 +40,10 @@ function assertSimpleAccountId(accountId) {
 
 async function promptValue(rl, label, fallback = "", { secret = false } = {}) {
   const suffix = fallback ? ` [${fallback}]` : "";
-  if (!secret) {
-    const value = await rl.question(`${label}${suffix}: `);
-    return value.trim() || fallback;
-  }
-
-  output.write(`${label}${suffix}: `);
-  const value = await rl.question("", {
+  const value = await rl.question(`${label}${suffix}: `, secret ? {
+    // Some Linux terminals do not reliably block on an empty prompt string.
     signal: AbortSignal.timeout(10 * 60 * 1000)
-  });
+  } : undefined);
   return value.trim() || fallback;
 }
 

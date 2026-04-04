@@ -2,10 +2,10 @@
 
 This workspace contains two publishable packages:
 
-- `@openclaw/xiaozhi`
+- `@galaxyxieyu/openclaw-xiaozhi`
   Native OpenClaw channel plugin. It keeps an outbound WebSocket bridge to `xiaozhi-server`, translates JSON-RPC, and routes each peer to the selected OpenClaw agent.
-- `@openclaw/xiaozhi-cli`
-  Installer CLI intended for `npx -y @openclaw/xiaozhi-cli@latest install`. It issues a bridge token from `xiaozhi-server`, installs/enables the plugin, writes `channels.xiaozhi` config, and restarts the OpenClaw gateway.
+- `@galaxyxieyu/openclaw-xiaozhi-cli`
+  Installer CLI intended for `npx -y --registry=https://registry.npmjs.org @galaxyxieyu/openclaw-xiaozhi-cli@latest install`. It issues a bridge token from `xiaozhi-server`, installs/enables the plugin, writes `channels.xiaozhi` config, and restarts the OpenClaw gateway.
 
 ## Config shape
 
