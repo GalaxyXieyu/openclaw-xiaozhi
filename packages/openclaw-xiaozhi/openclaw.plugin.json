@@ -1,0 +1,14 @@
+{
+  "id": "xiaozhi",
+  "name": "Xiaozhi",
+  "description": "Bridge xiaozhi-server to OpenClaw over outbound WebSocket.",
+  "version": "0.1.0",
+  "channels": [
+    "xiaozhi"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

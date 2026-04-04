@@ -1,0 +1,48 @@
+{
+  "name": "@galaxyxieyu/openclaw-xiaozhi",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for xiaozhi-server bridge mode",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GalaxyXieyu/openclaw-xiaozhi.git"
+  },
+  "homepage": "https://github.com/GalaxyXieyu/openclaw-xiaozhi#readme",
+  "bugs": {
+    "url": "https://github.com/GalaxyXieyu/openclaw-xiaozhi/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "openclaw",
+    "xiaozhi",
+    "plugin",
+    "channel",
+    "agent"
+  ],
+  "files": [
+    "index.js",
+    "setup-entry.js",
+    "openclaw.plugin.json",
+    "src"
+  ],
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "setupEntry": "./setup-entry.js",
+    "channel": {
+      "id": "xiaozhi",
+      "label": "Xiaozhi",
+      "blurb": "Bridge xiaozhi-server to OpenClaw over outbound WebSocket."
+    }
+  }
+}

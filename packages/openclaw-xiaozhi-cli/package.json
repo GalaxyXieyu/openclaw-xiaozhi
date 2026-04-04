@@ -1,0 +1,37 @@
+{
+  "name": "@galaxyxieyu/openclaw-xiaozhi-cli",
+  "version": "0.1.0",
+  "description": "Installer CLI for the OpenClaw xiaozhi bridge plugin",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GalaxyXieyu/openclaw-xiaozhi.git"
+  },
+  "homepage": "https://github.com/GalaxyXieyu/openclaw-xiaozhi#readme",
+  "bugs": {
+    "url": "https://github.com/GalaxyXieyu/openclaw-xiaozhi/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "openclaw",
+    "xiaozhi",
+    "cli",
+    "installer"
+  ],
+  "bin": {
+    "openclaw-xiaozhi": "./bin/openclaw-xiaozhi.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "openclawXiaozhi": {
+    "pluginPackage": "@galaxyxieyu/openclaw-xiaozhi"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ]
+}
