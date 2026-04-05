@@ -2,7 +2,7 @@
 
 `@galaxyxieyu/xiaozhi` is a native OpenClaw channel plugin for the self-hosted Xiaozhi bridge flow.
 
-It does three things:
+It does four things:
 
 1. Keeps an outbound WebSocket connection to `xiaozhi-server`.
 2. Handles the JSON-RPC methods `xiaozhi.sessionStarted`, `xiaozhi.sessionEnded`, `xiaozhi.chat`, and `xiaozhi.bindPeerAgent`.
@@ -10,6 +10,7 @@ It does three things:
    - runtime overrides: `peer -> agentId`
    - static bindings from config
    - account-level default agent
+4. Registers `xiaozhi_push_text`, which lets an agent or subagent proactively push TTS back to the current Xiaozhi device.
 
 ## Local development
 

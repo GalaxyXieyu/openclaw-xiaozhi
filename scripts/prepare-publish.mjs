@@ -74,7 +74,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const scope = normalizeScope(args.scope);
   const repoFields = buildRepoFields(args.repo);
-  const pluginPackageName = `${scope}/openclaw-xiaozhi`;
+  const pluginPackageName = `${scope}/xiaozhi`;
   const cliPackageName = `${scope}/openclaw-xiaozhi-cli`;
 
   const pluginPackagePath = path.join(

@@ -11,6 +11,13 @@ export default {
   register(api) {
     api.registerChannel({ plugin: xiaozhiChannelPlugin });
     const service = new XiaozhiBridgeService(api);
+    api.registerTool((ctx) => service.createPushTextTool(ctx));
+    api.on("subagent_spawned", (event, ctx) => {
+      service.handleSubagentSpawned(event, ctx);
+    });
+    api.on("session_end", (_event, ctx) => {
+      service.handleSessionEnded(ctx);
+    });
     api.registerService({
       id: "xiaozhi-bridge",
       start: async () => {

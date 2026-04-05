@@ -27,9 +27,10 @@ function mergeObjects(base, extra) {
 }
 
 export class XiaozhiAgentRouter {
-  constructor(api, overrides) {
+  constructor(api, overrides, sessionTargets) {
     this.api = api;
     this.overrides = overrides;
+    this.sessionTargets = sessionTargets;
     this.sessions = new Map();
   }
 
@@ -56,6 +57,7 @@ export class XiaozhiAgentRouter {
   async onSessionEnded(params) {
     const key = this.buildSessionKey(params.account, params.sessionId);
     this.sessions.delete(key);
+    this.sessionTargets?.deleteByXiaozhiSession(params.account, params.sessionId);
     return { ok: true };
   }
 
@@ -244,6 +246,7 @@ export class XiaozhiAgentRouter {
         id: peerId
       }
     });
+    this.rememberSessionTarget(route, params);
     const ctx = this.buildInboundContext({
       route,
       accountId,
@@ -335,6 +338,26 @@ export class XiaozhiAgentRouter {
       `[xiaozhi] empty reply account=${accountId} peer=${peerId} agent=${agentName || agentId}`
     );
     return "";
+  }
+
+  rememberSessionTarget(route, params) {
+    if (!this.sessionTargets || !route) {
+      return;
+    }
+
+    const target = {
+      account: params.account || "default",
+      sessionId: params.sessionId,
+      deviceId: params.deviceId,
+      clientId: params.clientId,
+      peerId: params.peerId,
+      speaker: params.speaker ?? null
+    };
+
+    this.sessionTargets.remember(route.sessionKey, target);
+    if (typeof route.mainSessionKey === "string" && route.mainSessionKey) {
+      this.sessionTargets.remember(route.mainSessionKey, target);
+    }
   }
 
   extractText(result) {

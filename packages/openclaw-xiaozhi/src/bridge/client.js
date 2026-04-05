@@ -2,9 +2,11 @@ import WebSocket from "ws";
 
 import { XiaozhiAgentRouter } from "../router/agent-router.js";
 import { RuntimeOverrideStore } from "../store/runtime-overrides.js";
+import { SessionTargetStore } from "../store/session-targets.js";
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
+const REQUEST_TIMEOUT_MS = 30000;
 const SUPPORTED_METHODS = new Set([
   "xiaozhi.sessionStarted",
   "xiaozhi.sessionEnded",
@@ -45,6 +47,8 @@ class XiaozhiBridgeClient {
     this.stopped = false;
     this.runTask = null;
     this.socket = null;
+    this.nextRequestId = 1;
+    this.pendingResults = new Map();
   }
 
   async start() {
@@ -124,6 +128,13 @@ class XiaozhiBridgeClient {
         this.api.logger.warn(
           `[xiaozhi] bridge closed ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)} code=${code} reason=${reason.toString()}`
         );
+        const error = new Error(
+          `xiaozhi bridge disconnected: ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}`
+        );
+        for (const pending of this.pendingResults.values()) {
+          pending.reject(error);
+        }
+        this.pendingResults.clear();
         this.socket = null;
         resolve();
       });
@@ -132,6 +143,10 @@ class XiaozhiBridgeClient {
 
   async handlePayload(payload) {
     if (!payload || typeof payload !== "object") {
+      return;
+    }
+    if (payload.id !== undefined && ("result" in payload || "error" in payload)) {
+      this.handleResult(payload);
       return;
     }
     const method = payload.method;
@@ -204,13 +219,60 @@ class XiaozhiBridgeClient {
     }
     this.socket.send(JSON.stringify(payload));
   }
+
+  async callServer(method, params, timeoutMs = REQUEST_TIMEOUT_MS) {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      throw new Error("xiaozhi bridge is not connected");
+    }
+
+    const id = this.nextRequestId++;
+    const pending = {};
+    const promise = new Promise((resolve, reject) => {
+      pending.resolve = resolve;
+      pending.reject = reject;
+      pending.timer = setTimeout(() => {
+        this.pendingResults.delete(id);
+        reject(new Error(`xiaozhi rpc timeout: ${method}`));
+      }, timeoutMs);
+    });
+
+    this.pendingResults.set(id, pending);
+    this.send({
+      jsonrpc: "2.0",
+      id,
+      method,
+      params: params ?? {}
+    });
+    return await promise;
+  }
+
+  handleResult(payload) {
+    const pending = this.pendingResults.get(payload.id);
+    if (!pending) {
+      return;
+    }
+    this.pendingResults.delete(payload.id);
+    clearTimeout(pending.timer);
+
+    if (payload.error) {
+      const message =
+        typeof payload.error?.message === "string"
+          ? payload.error.message
+          : String(payload.error);
+      pending.reject(new Error(message));
+      return;
+    }
+
+    pending.resolve(payload.result);
+  }
 }
 
 export class XiaozhiBridgeService {
   constructor(api) {
     this.api = api;
     this.overrides = new RuntimeOverrideStore();
-    this.router = new XiaozhiAgentRouter(api, this.overrides);
+    this.sessionTargets = new SessionTargetStore();
+    this.router = new XiaozhiAgentRouter(api, this.overrides, this.sessionTargets);
     this.clients = new Map();
   }
 
@@ -246,5 +308,152 @@ export class XiaozhiBridgeService {
       await client.stop();
     }
     this.overrides.clear();
+    this.sessionTargets.clear();
+  }
+
+  createPushTextTool(ctx) {
+    return {
+      name: "xiaozhi_push_text",
+      label: "Xiaozhi Push Text",
+      description:
+        "Push a spoken message to the current Xiaozhi device. Use this when a background task or subagent finishes and the hardware should proactively speak the result.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          text: {
+            type: "string",
+            description: "The text that Xiaozhi should speak."
+          },
+          sessionId: {
+            type: "string",
+            description: "Optional xiaozhi-server sessionId override."
+          },
+          deviceId: {
+            type: "string",
+            description: "Optional device-id override."
+          },
+          peerId: {
+            type: "string",
+            description: "Optional peer.id override, such as device-id or device-id:user-id."
+          },
+          account: {
+            type: "string",
+            description: "Optional Xiaozhi account override. Defaults to the current account."
+          }
+        },
+        required: ["text"]
+      },
+      execute: async (_id, params) => this.pushText(params, ctx)
+    };
+  }
+
+  async pushText(params, ctx = {}) {
+    const text = typeof params?.text === "string" ? params.text.trim() : "";
+    if (!text) {
+      throw new Error("text required");
+    }
+
+    const target = this.resolvePushTarget(params, ctx);
+    const accountId = target.account || "default";
+    const client = this.resolveClient(accountId);
+    if (!client) {
+      throw new Error(`xiaozhi bridge client unavailable for account=${accountId}`);
+    }
+
+    const method =
+      client.accountConfig?.pushTextMethod || "xiaozhi.pushText";
+    this.api.logger.info(
+      `[xiaozhi] push text account=${accountId} session=${target.sessionId || ""} device=${target.deviceId || ""} peer=${target.peerId || ""} sourceSession=${ctx?.sessionKey || ""}`
+    );
+    const result = await client.callServer(method, {
+      account: accountId,
+      sessionId: target.sessionId,
+      deviceId: target.deviceId,
+      peerId: target.peerId,
+      text
+    });
+    return {
+      ok: true,
+      ...target,
+      result
+    };
+  }
+
+  resolvePushTarget(params, ctx = {}) {
+    const explicitAccount =
+      typeof params?.account === "string" && params.account.trim()
+        ? params.account.trim()
+        : "";
+    const explicitSessionId =
+      typeof params?.sessionId === "string" && params.sessionId.trim()
+        ? params.sessionId.trim()
+        : "";
+    const explicitDeviceId =
+      typeof params?.deviceId === "string" && params.deviceId.trim()
+        ? params.deviceId.trim()
+        : "";
+    const explicitPeerId =
+      typeof params?.peerId === "string" && params.peerId.trim()
+        ? params.peerId.trim()
+        : "";
+
+    if (explicitSessionId || explicitDeviceId || explicitPeerId) {
+      return {
+        account: explicitAccount || ctx?.agentAccountId || "default",
+        sessionId: explicitSessionId || undefined,
+        deviceId: explicitDeviceId || undefined,
+        peerId: explicitPeerId || undefined
+      };
+    }
+
+    const mappedTarget = this.sessionTargets.get(ctx?.sessionKey);
+    if (mappedTarget) {
+      return {
+        ...mappedTarget,
+        account: explicitAccount || mappedTarget.account || ctx?.agentAccountId || "default"
+      };
+    }
+
+    if (typeof ctx?.requesterSenderId === "string" && ctx.requesterSenderId.trim()) {
+      return {
+        account: explicitAccount || ctx?.agentAccountId || "default",
+        peerId: ctx.requesterSenderId.trim()
+      };
+    }
+
+    throw new Error(
+      "No Xiaozhi target available. Provide sessionId/deviceId/peerId or call this tool from a Xiaozhi-routed session."
+    );
+  }
+
+  resolveClient(accountId) {
+    const exact = this.clients.get(accountId);
+    if (exact) {
+      return exact;
+    }
+    if (this.clients.size === 1) {
+      return [...this.clients.values()][0];
+    }
+    return this.clients.get("default") ?? null;
+  }
+
+  handleSubagentSpawned(event, ctx = {}) {
+    const sourceSessionKey = ctx?.requesterSessionKey || event?.requesterSessionKey;
+    const childSessionKey = ctx?.childSessionKey || event?.childSessionKey;
+    const inherited = this.sessionTargets.inherit(sourceSessionKey, childSessionKey);
+    if (!inherited) {
+      return;
+    }
+    this.api.logger.info(
+      `[xiaozhi] inherited target requester=${sourceSessionKey || ""} child=${childSessionKey || ""} device=${inherited.deviceId || ""} peer=${inherited.peerId || ""}`
+    );
+  }
+
+  handleSessionEnded(ctx = {}) {
+    if (!ctx?.sessionKey) {
+      return;
+    }
+    this.sessionTargets.delete(ctx.sessionKey);
   }
 }
