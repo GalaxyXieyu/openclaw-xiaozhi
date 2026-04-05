@@ -1,32 +1,15 @@
-import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
+import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
 
 import { xiaozhiChannelPlugin } from "./src/channel/xiaozhi-channel.js";
 import { XiaozhiBridgeService } from "./src/bridge/client.js";
 
-export default defineChannelPluginEntry({
+export default {
   id: "xiaozhi",
   name: "Xiaozhi",
   description: "Bridge xiaozhi-server to OpenClaw over outbound WebSocket.",
-  plugin: xiaozhiChannelPlugin,
-  registerCliMetadata(api) {
-    api.registerCli(
-      ({ program }) => {
-        program
-          .command("xiaozhi")
-          .description("Inspect xiaozhi bridge status inside OpenClaw");
-      },
-      {
-        descriptors: [
-          {
-            name: "xiaozhi",
-            description: "Inspect xiaozhi bridge status inside OpenClaw",
-            hasSubcommands: false
-          }
-        ]
-      }
-    );
-  },
-  registerFull(api) {
+  configSchema: emptyPluginConfigSchema(),
+  register(api) {
+    api.registerChannel({ plugin: xiaozhiChannelPlugin });
     const service = new XiaozhiBridgeService(api);
     api.registerService({
       id: "xiaozhi-bridge",
@@ -38,4 +21,4 @@ export default defineChannelPluginEntry({
       }
     });
   }
-});
+};
