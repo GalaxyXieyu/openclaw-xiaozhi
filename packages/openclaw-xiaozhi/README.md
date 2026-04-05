@@ -1,6 +1,6 @@
-# @openclaw/xiaozhi
+# @galaxyxieyu/xiaozhi
 
-`@openclaw/xiaozhi` is a native OpenClaw channel plugin for the self-hosted Xiaozhi bridge flow.
+`@galaxyxieyu/xiaozhi` is a native OpenClaw channel plugin for the self-hosted Xiaozhi bridge flow.
 
 It does three things:
 

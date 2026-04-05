@@ -13,7 +13,7 @@ const require = createRequire(import.meta.url);
 const packageJson = require("../package.json");
 const DEFAULT_ACCOUNT_ID = "default";
 const DEFAULT_PLUGIN_SPEC =
-  packageJson?.openclawXiaozhi?.pluginPackage || "@openclaw/xiaozhi";
+  packageJson?.openclawXiaozhi?.pluginPackage || "@galaxyxieyu/xiaozhi";
 
 function parseArgs(argv) {
   const [command = "help", ...rest] = argv;
