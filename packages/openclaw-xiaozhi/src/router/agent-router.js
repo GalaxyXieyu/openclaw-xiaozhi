@@ -92,7 +92,15 @@ export class XiaozhiAgentRouter {
       accountId,
       peerId: params.peerId,
       prompt: params.text,
-      speaker: params.speaker ?? null
+      speaker: params.speaker ?? null,
+      sessionTarget: {
+        account: accountId,
+        sessionId: params.sessionId,
+        deviceId: params.deviceId,
+        clientId: params.clientId,
+        peerId: params.peerId,
+        speaker: params.speaker ?? null
+      }
     });
     return {
       ok: true,
@@ -220,7 +228,16 @@ export class XiaozhiAgentRouter {
     );
   }
 
-  async runAgent({ cfg, agentId, agentName, accountId, peerId, prompt, speaker }) {
+  async runAgent({
+    cfg,
+    agentId,
+    agentName,
+    accountId,
+    peerId,
+    prompt,
+    speaker,
+    sessionTarget
+  }) {
     const channelRuntime = this.api.runtime?.channel;
     if (
       !channelRuntime?.routing?.resolveAgentRoute ||
@@ -246,7 +263,7 @@ export class XiaozhiAgentRouter {
         id: peerId
       }
     });
-    this.rememberSessionTarget(route, params);
+    this.rememberSessionTarget(route, sessionTarget);
     const ctx = this.buildInboundContext({
       route,
       accountId,

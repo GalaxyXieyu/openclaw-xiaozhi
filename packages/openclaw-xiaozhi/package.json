@@ -1,6 +1,6 @@
 {
   "name": "@galaxyxieyu/xiaozhi",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "OpenClaw channel plugin for xiaozhi-server bridge mode",
   "type": "module",
   "license": "MIT",
