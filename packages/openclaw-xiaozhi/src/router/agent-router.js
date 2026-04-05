@@ -1,8 +1,7 @@
-import crypto from "node:crypto";
-
 import { resolveStaticBinding } from "../store/static-bindings.js";
 
 const DEFAULT_AGENT_ID = "main";
+const XIAOZHI_CHANNEL_ID = "xiaozhi";
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -25,12 +24,6 @@ function mergeObjects(base, extra) {
     result[key] = value;
   }
   return result;
-}
-
-function sanitizeSessionId(value) {
-  return String(value || "")
-    .replace(/[^a-zA-Z0-9._-]/g, "_")
-    .slice(0, 180);
 }
 
 export class XiaozhiAgentRouter {
@@ -92,11 +85,12 @@ export class XiaozhiAgentRouter {
     const resolved = this.resolveTargetAgent(cfg, accountId, accountConfig, params.peerId);
     const text = await this.runAgent({
       cfg,
-      agentConfig: resolved.agentConfig,
       agentId: resolved.agentId,
+      agentName: resolved.agentName,
       accountId,
       peerId: params.peerId,
-      prompt: params.text
+      prompt: params.text,
+      speaker: params.speaker ?? null
     });
     return {
       ok: true,
@@ -162,27 +156,185 @@ export class XiaozhiAgentRouter {
     };
   }
 
-  async runAgent({ agentConfig, agentId, accountId, peerId, prompt }) {
-    const sessionId = sanitizeSessionId(
-      `xiaozhi-${accountId || "default"}-${agentId || DEFAULT_AGENT_ID}-${peerId || "peer"}`
+  buildRoutingConfig(cfg, { accountId, peerId, agentId }) {
+    const bindings = Array.isArray(cfg?.bindings) ? cfg.bindings : [];
+    return {
+      ...cfg,
+      bindings: [
+        {
+          type: "route",
+          agentId,
+          comment: "xiaozhi runtime override",
+          match: {
+            channel: XIAOZHI_CHANNEL_ID,
+            accountId,
+            peer: {
+              kind: "direct",
+              id: peerId
+            }
+          }
+        },
+        ...bindings
+      ]
+    };
+  }
+
+  buildInboundContext({
+    route,
+    accountId,
+    peerId,
+    prompt,
+    speaker
+  }) {
+    const label = speaker || peerId;
+    return this.api.runtime.channel.reply.finalizeInboundContext(
+      {
+        Body: prompt,
+        BodyForAgent: prompt,
+        RawBody: prompt,
+        CommandBody: prompt,
+        BodyForCommands: prompt,
+        From: label,
+        To: peerId,
+        SessionKey: route.sessionKey,
+        AccountId: accountId,
+        SenderId: peerId,
+        SenderName: speaker || undefined,
+        Timestamp: Date.now(),
+        Provider: XIAOZHI_CHANNEL_ID,
+        Surface: XIAOZHI_CHANNEL_ID,
+        ChatType: "direct",
+        ConversationLabel: label,
+        OriginatingChannel: XIAOZHI_CHANNEL_ID,
+        OriginatingTo: peerId,
+        ExplicitDeliverRoute: true
+      },
+      {
+        forceBodyForAgent: true,
+        forceBodyForCommands: true,
+        forceChatType: true,
+        forceConversationLabel: true
+      }
     );
-    await this.api.runtime.agent.ensureAgentWorkspace(agentConfig);
-    const sessionFile = this.api.runtime.agent.session.resolveSessionFilePath(
-      agentConfig,
-      sessionId
-    );
-    const workspaceDir = this.api.runtime.agent.resolveAgentWorkspaceDir(agentConfig);
-    const timeoutMs = this.api.runtime.agent.resolveAgentTimeoutMs(agentConfig);
-    const result = await this.api.runtime.agent.runEmbeddedPiAgent({
-      sessionId,
-      runId: crypto.randomUUID(),
-      config: agentConfig,
-      sessionFile,
-      workspaceDir,
-      prompt,
-      timeoutMs
+  }
+
+  async runAgent({ cfg, agentId, agentName, accountId, peerId, prompt, speaker }) {
+    const channelRuntime = this.api.runtime?.channel;
+    if (
+      !channelRuntime?.routing?.resolveAgentRoute ||
+      !channelRuntime?.reply?.dispatchReplyWithBufferedBlockDispatcher ||
+      !channelRuntime?.reply?.finalizeInboundContext ||
+      !channelRuntime?.session?.resolveStorePath ||
+      !channelRuntime?.session?.recordInboundSession
+    ) {
+      throw new Error("OpenClaw channel runtime is unavailable for xiaozhi routing");
+    }
+
+    const routingCfg = this.buildRoutingConfig(cfg, {
+      accountId,
+      peerId,
+      agentId
     });
-    return this.extractText(result);
+    const route = channelRuntime.routing.resolveAgentRoute({
+      cfg: routingCfg,
+      channel: XIAOZHI_CHANNEL_ID,
+      accountId,
+      peer: {
+        kind: "direct",
+        id: peerId
+      }
+    });
+    const ctx = this.buildInboundContext({
+      route,
+      accountId,
+      peerId,
+      prompt,
+      speaker
+    });
+    const storePath = channelRuntime.session.resolveStorePath(undefined, {
+      agentId: route.agentId
+    });
+    const lastRouteSessionKey =
+      route.lastRoutePolicy === "main" ? route.mainSessionKey : route.sessionKey;
+
+    this.api.logger.info(
+      `[xiaozhi] route chat account=${accountId} peer=${peerId} agent=${route.agentId} session=${route.sessionKey} matchedBy=${route.matchedBy}`
+    );
+
+    await channelRuntime.session.recordInboundSession({
+      storePath,
+      sessionKey: route.sessionKey,
+      ctx,
+      createIfMissing: true,
+      updateLastRoute: {
+        sessionKey: lastRouteSessionKey,
+        channel: XIAOZHI_CHANNEL_ID,
+        to: peerId,
+        accountId
+      },
+      onRecordError: (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.api.logger.error(
+          `[xiaozhi] record inbound session failed account=${accountId} peer=${peerId}: ${message}`
+        );
+      }
+    });
+
+    const finalTexts = [];
+    const interimTexts = [];
+    let dispatchError = null;
+
+    await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+      ctx,
+      cfg: routingCfg,
+      dispatcherOptions: {
+        deliver: async (payload, info) => {
+          const text = this.extractText(payload);
+          if (!text) {
+            return;
+          }
+          if (payload?.isError) {
+            if (!dispatchError) {
+              dispatchError = new Error(text);
+            }
+            return;
+          }
+          if (info?.kind === "final") {
+            finalTexts.push(text);
+            return;
+          }
+          interimTexts.push(text);
+        },
+        onError: (error, info) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.api.logger.error(
+            `[xiaozhi] dispatch reply failed account=${accountId} peer=${peerId} agent=${agentId} kind=${info?.kind || "unknown"}: ${message}`
+          );
+          if (!dispatchError) {
+            dispatchError = error instanceof Error ? error : new Error(message);
+          }
+        }
+      }
+    });
+
+    const finalText = finalTexts.join("\n").trim();
+    if (finalText) {
+      return finalText;
+    }
+
+    const interimText = interimTexts.join("\n").trim();
+    if (interimText) {
+      return interimText;
+    }
+
+    if (dispatchError) {
+      throw dispatchError;
+    }
+
+    this.api.logger.warn(
+      `[xiaozhi] empty reply account=${accountId} peer=${peerId} agent=${agentName || agentId}`
+    );
+    return "";
   }
 
   extractText(result) {

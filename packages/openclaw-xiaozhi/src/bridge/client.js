@@ -156,6 +156,16 @@ class XiaozhiBridgeClient {
     };
 
     try {
+      if (method === "xiaozhi.chat") {
+        this.api.logger.info(
+          `[xiaozhi] inbound chat account=${params.account} peer=${params.peerId || "unknown"} textLength=${String(params.text || "").length}`
+        );
+      } else if (method === "xiaozhi.bindPeerAgent") {
+        this.api.logger.info(
+          `[xiaozhi] bind peer account=${params.account} peer=${params.peerId || "unknown"} agent=${params.agentId || "unknown"}`
+        );
+      }
+
       let result = { ok: true };
       if (method === "xiaozhi.sessionStarted") {
         result = await this.router.onSessionStarted(params);
@@ -175,6 +185,9 @@ class XiaozhiBridgeClient {
         });
       }
     } catch (error) {
+      this.api.logger.error(
+        `[xiaozhi] rpc failed ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)} method=${method}: ${normalizeError(error).message}`
+      );
       if (id !== undefined) {
         this.send({
           jsonrpc: "2.0",
