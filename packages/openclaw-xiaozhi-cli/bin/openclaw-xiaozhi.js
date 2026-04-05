@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
 import process from "node:process";
+import os from "node:os";
+import path from "node:path";
+import fs from "node:fs";
 import { createRequire } from "node:module";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline/promises";
@@ -106,6 +109,28 @@ function tryRunOpenClawCapture(args) {
   }
 }
 
+function runOpenClawBestEffort(args) {
+  const result = spawnSync("openclaw", args, {
+    stdio: "inherit"
+  });
+  return result.status === 0;
+}
+
+function resolvePluginDir(pluginId = "xiaozhi") {
+  return path.join(os.homedir(), ".openclaw", "extensions", pluginId);
+}
+
+function cleanupExistingPlugin(pluginId = "xiaozhi") {
+  const pluginDir = resolvePluginDir(pluginId);
+  if (fs.existsSync(pluginDir)) {
+    fs.rmSync(pluginDir, { recursive: true, force: true });
+  }
+}
+
+function healConfigBeforeInstall() {
+  runOpenClawBestEffort(["doctor", "--fix"]);
+}
+
 async function installCommand(options) {
   const rl = createInterface({ input, output });
   try {
@@ -138,6 +163,12 @@ async function installCommand(options) {
       options["bridge-id"] || ""
     );
 
+    const pluginSpec = options["plugin-spec"] || DEFAULT_PLUGIN_SPEC;
+    healConfigBeforeInstall();
+    cleanupExistingPlugin("xiaozhi");
+    runOpenClaw(["plugins", "install", pluginSpec]);
+    runOpenClaw(["plugins", "enable", "xiaozhi"]);
+
     const issued = await issueBridgeToken({
       serverUrl,
       adminKey,
@@ -147,7 +178,6 @@ async function installCommand(options) {
       bridgeId
     });
 
-    const pluginSpec = options["plugin-spec"] || DEFAULT_PLUGIN_SPEC;
     const accountConfig = {
       enabled: true,
       bridgeId: issued.bridge.bridgeId,
@@ -157,8 +187,6 @@ async function installCommand(options) {
       staticBindings: {}
     };
 
-    runOpenClaw(["plugins", "install", pluginSpec]);
-    runOpenClaw(["plugins", "enable", "xiaozhi"]);
     runOpenClaw([
       "config",
       "set",
