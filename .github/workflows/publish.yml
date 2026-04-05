@@ -1,6 +1,9 @@
 name: Publish Packages
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
