@@ -479,6 +479,7 @@ export class XiaozhiBridgeService {
     const current =
       this.replyState.get(key) ??
       {
+        isRouteRoot: false,
         activeSyncRuns: 0,
         lastImmediateText: "",
         lastPushedText: ""
@@ -493,6 +494,7 @@ export class XiaozhiBridgeService {
       if (!state) {
         continue;
       }
+      state.isRouteRoot = true;
       state.activeSyncRuns += 1;
     }
   }
@@ -534,7 +536,11 @@ export class XiaozhiBridgeService {
       return;
     }
 
-    const state = this.ensureReplyState(sessionKey);
+    const state = this.replyState.get(sessionKey) ?? null;
+    if (!state?.isRouteRoot) {
+      return;
+    }
+
     if (state?.activeSyncRuns > 0) {
       this.api.logger.info(
         `[xiaozhi] skip auto-push for active sync run session=${sessionKey}`
