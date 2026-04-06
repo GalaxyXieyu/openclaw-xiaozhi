@@ -7,6 +7,7 @@ import { SessionTargetStore } from "../store/session-targets.js";
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
 const REQUEST_TIMEOUT_MS = 30000;
+const XIAOZHI_CHANNEL_ID = "xiaozhi";
 const SUPPORTED_METHODS = new Set([
   "xiaozhi.sessionStarted",
   "xiaozhi.sessionEnded",
@@ -272,7 +273,15 @@ export class XiaozhiBridgeService {
     this.api = api;
     this.overrides = new RuntimeOverrideStore();
     this.sessionTargets = new SessionTargetStore();
-    this.router = new XiaozhiAgentRouter(api, this.overrides, this.sessionTargets);
+    this.replyState = new Map();
+    this.router = new XiaozhiAgentRouter(api, this.overrides, this.sessionTargets, {
+      onRouteStart: (route) => {
+        this.markRouteStart(route);
+      },
+      onRouteSettled: (route, text) => {
+        this.markRouteSettled(route, text);
+      }
+    });
     this.clients = new Map();
   }
 
@@ -309,6 +318,7 @@ export class XiaozhiBridgeService {
     }
     this.overrides.clear();
     this.sessionTargets.clear();
+    this.replyState.clear();
   }
 
   createPushTextTool(ctx) {
@@ -438,6 +448,220 @@ export class XiaozhiBridgeService {
     return this.clients.get("default") ?? null;
   }
 
+  getRouteKeys(routeOrSessionKey) {
+    if (typeof routeOrSessionKey === "string") {
+      return routeOrSessionKey.trim() ? [routeOrSessionKey.trim()] : [];
+    }
+
+    const keys = new Set();
+    const sessionKey =
+      typeof routeOrSessionKey?.sessionKey === "string"
+        ? routeOrSessionKey.sessionKey.trim()
+        : "";
+    const mainSessionKey =
+      typeof routeOrSessionKey?.mainSessionKey === "string"
+        ? routeOrSessionKey.mainSessionKey.trim()
+        : "";
+    if (sessionKey) {
+      keys.add(sessionKey);
+    }
+    if (mainSessionKey) {
+      keys.add(mainSessionKey);
+    }
+    return [...keys];
+  }
+
+  ensureReplyState(sessionKey) {
+    const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
+    if (!key) {
+      return null;
+    }
+    const current =
+      this.replyState.get(key) ??
+      {
+        activeSyncRuns: 0,
+        lastImmediateText: "",
+        lastPushedText: ""
+      };
+    this.replyState.set(key, current);
+    return current;
+  }
+
+  markRouteStart(route) {
+    for (const sessionKey of this.getRouteKeys(route)) {
+      const state = this.ensureReplyState(sessionKey);
+      if (!state) {
+        continue;
+      }
+      state.activeSyncRuns += 1;
+    }
+  }
+
+  markRouteSettled(route, text = "") {
+    const normalizedText = this.normalizePushText(text);
+    for (const sessionKey of this.getRouteKeys(route)) {
+      const state = this.ensureReplyState(sessionKey);
+      if (!state) {
+        continue;
+      }
+      state.activeSyncRuns = Math.max(0, state.activeSyncRuns - 1);
+      if (normalizedText) {
+        state.lastImmediateText = normalizedText;
+      }
+    }
+  }
+
+  async handleAgentEnded(event, ctx = {}) {
+    const sessionKey =
+      typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "";
+    if (!sessionKey) {
+      return;
+    }
+
+    const channelId =
+      typeof ctx?.channelId === "string" ? ctx.channelId.trim() : "";
+    const messageProvider =
+      typeof ctx?.messageProvider === "string" ? ctx.messageProvider.trim() : "";
+    if (
+      channelId !== XIAOZHI_CHANNEL_ID &&
+      messageProvider !== XIAOZHI_CHANNEL_ID
+    ) {
+      return;
+    }
+
+    const target = this.sessionTargets.get(sessionKey);
+    if (!target) {
+      return;
+    }
+
+    const state = this.ensureReplyState(sessionKey);
+    if (state?.activeSyncRuns > 0) {
+      this.api.logger.info(
+        `[xiaozhi] skip auto-push for active sync run session=${sessionKey}`
+      );
+      return;
+    }
+
+    const finalText = this.normalizePushText(
+      this.extractFinalAssistantText(event?.messages)
+    );
+    if (!finalText || finalText === "NO_REPLY") {
+      return;
+    }
+
+    if (
+      finalText === state?.lastImmediateText ||
+      finalText === state?.lastPushedText
+    ) {
+      this.api.logger.info(
+        `[xiaozhi] skip duplicate auto-push session=${sessionKey}`
+      );
+      return;
+    }
+
+    try {
+      await this.pushText(
+        {
+          account: target.account,
+          sessionId: target.sessionId,
+          deviceId: target.deviceId,
+          peerId: target.peerId,
+          text: finalText
+        },
+        {
+          sessionKey,
+          agentAccountId: target.account,
+          requesterSenderId: target.peerId
+        }
+      );
+      if (state) {
+        state.lastPushedText = finalText;
+      }
+      this.api.logger.info(
+        `[xiaozhi] auto-pushed async reply session=${sessionKey} peer=${target.peerId || ""}`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.api.logger.error(
+        `[xiaozhi] auto-push failed session=${sessionKey}: ${message}`
+      );
+    }
+  }
+
+  extractFinalAssistantText(messages) {
+    if (!Array.isArray(messages)) {
+      return "";
+    }
+
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const candidate = this.extractAssistantMessageText(messages[index]);
+      if (candidate) {
+        return candidate;
+      }
+    }
+    return "";
+  }
+
+  extractAssistantMessageText(entry) {
+    const message =
+      entry && typeof entry === "object" && entry.message && typeof entry.message === "object"
+        ? entry.message
+        : entry;
+    if (!message || typeof message !== "object") {
+      return "";
+    }
+    if (message.role !== "assistant") {
+      return "";
+    }
+    return this.extractRichText(message.content ?? message.text ?? message);
+  }
+
+  extractRichText(value) {
+    if (!value) {
+      return "";
+    }
+    if (typeof value === "string") {
+      return value.trim();
+    }
+    if (Array.isArray(value)) {
+      return value
+        .map((item) => this.extractRichText(item))
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    }
+    if (typeof value !== "object") {
+      return String(value).trim();
+    }
+
+    if (value.type === "text" && typeof value.text === "string") {
+      return value.text.trim();
+    }
+
+    const directKeys = ["text", "content", "message", "payload", "result"];
+    for (const key of directKeys) {
+      const candidate = this.extractRichText(value[key]);
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    return "";
+  }
+
+  normalizePushText(text) {
+    const input = typeof text === "string" ? text : "";
+    return input
+      .replace(/\[\[reply_to_current\]\]\s*/g, "")
+      .replace(/^MEDIA:\s+.*$/gmu, "")
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, "$1")
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/^#{1,6}\s+/gmu, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
   handleSubagentSpawned(event, ctx = {}) {
     const sourceSessionKey = ctx?.requesterSessionKey || event?.requesterSessionKey;
     const childSessionKey = ctx?.childSessionKey || event?.childSessionKey;
@@ -455,5 +679,6 @@ export class XiaozhiBridgeService {
       return;
     }
     this.sessionTargets.delete(ctx.sessionKey);
+    this.replyState.delete(ctx.sessionKey);
   }
 }

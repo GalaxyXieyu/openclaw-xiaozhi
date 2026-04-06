@@ -27,10 +27,11 @@ function mergeObjects(base, extra) {
 }
 
 export class XiaozhiAgentRouter {
-  constructor(api, overrides, sessionTargets) {
+  constructor(api, overrides, sessionTargets, hooks = {}) {
     this.api = api;
     this.overrides = overrides;
     this.sessionTargets = sessionTargets;
+    this.hooks = hooks;
     this.sessions = new Map();
   }
 
@@ -263,6 +264,7 @@ export class XiaozhiAgentRouter {
         id: peerId
       }
     });
+    this.hooks?.onRouteStart?.(route);
     this.rememberSessionTarget(route, sessionTarget);
     const ctx = this.buildInboundContext({
       route,
@@ -303,57 +305,74 @@ export class XiaozhiAgentRouter {
     const finalTexts = [];
     const interimTexts = [];
     let dispatchError = null;
+    let routeSettled = false;
+    const settleRoute = (text = "") => {
+      if (routeSettled) {
+        return;
+      }
+      routeSettled = true;
+      this.hooks?.onRouteSettled?.(route, text);
+    };
 
-    await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
-      ctx,
-      cfg: routingCfg,
-      dispatcherOptions: {
-        deliver: async (payload, info) => {
-          const text = this.extractText(payload);
-          if (!text) {
-            return;
-          }
-          if (payload?.isError) {
-            if (!dispatchError) {
-              dispatchError = new Error(text);
+    try {
+      await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+        ctx,
+        cfg: routingCfg,
+        dispatcherOptions: {
+          deliver: async (payload, info) => {
+            const text = this.extractText(payload);
+            if (!text) {
+              return;
             }
-            return;
-          }
-          if (info?.kind === "final") {
-            finalTexts.push(text);
-            return;
-          }
-          interimTexts.push(text);
-        },
-        onError: (error, info) => {
-          const message = error instanceof Error ? error.message : String(error);
-          this.api.logger.error(
-            `[xiaozhi] dispatch reply failed account=${accountId} peer=${peerId} agent=${agentId} kind=${info?.kind || "unknown"}: ${message}`
-          );
-          if (!dispatchError) {
-            dispatchError = error instanceof Error ? error : new Error(message);
+            if (payload?.isError) {
+              if (!dispatchError) {
+                dispatchError = new Error(text);
+              }
+              return;
+            }
+            if (info?.kind === "final") {
+              finalTexts.push(text);
+              return;
+            }
+            interimTexts.push(text);
+          },
+          onError: (error, info) => {
+            const message = error instanceof Error ? error.message : String(error);
+            this.api.logger.error(
+              `[xiaozhi] dispatch reply failed account=${accountId} peer=${peerId} agent=${agentId} kind=${info?.kind || "unknown"}: ${message}`
+            );
+            if (!dispatchError) {
+              dispatchError = error instanceof Error ? error : new Error(message);
+            }
           }
         }
-      }
-    });
+      });
+    } catch (error) {
+      settleRoute();
+      throw error;
+    }
 
     const finalText = finalTexts.join("\n").trim();
     if (finalText) {
+      settleRoute(finalText);
       return finalText;
     }
 
     const interimText = interimTexts.join("\n").trim();
     if (interimText) {
+      settleRoute(interimText);
       return interimText;
     }
 
     if (dispatchError) {
+      settleRoute();
       throw dispatchError;
     }
 
     this.api.logger.warn(
       `[xiaozhi] empty reply account=${accountId} peer=${peerId} agent=${agentName || agentId}`
     );
+    settleRoute();
     return "";
   }
 
