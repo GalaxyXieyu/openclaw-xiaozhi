@@ -1,7 +1,14 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
 import { resolveStaticBinding } from "../store/static-bindings.js";
 
 const DEFAULT_AGENT_ID = "main";
 const XIAOZHI_CHANNEL_ID = "xiaozhi";
+let coreRootCache = null;
+let coreDepsPromise = null;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -26,6 +33,149 @@ function mergeObjects(base, extra) {
   return result;
 }
 
+function sanitizeSessionId(value) {
+  return String(value || "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_")
+    .slice(0, 180);
+}
+
+function normalizeBindingEntries(bindings) {
+  if (Array.isArray(bindings)) {
+    return bindings
+      .map((item) => {
+        if (!isObject(item)) {
+          return null;
+        }
+        const peerId = typeof item.peerId === "string" ? item.peerId.trim() : "";
+        const agentId = typeof item.agentId === "string" ? item.agentId.trim() : "";
+        if (!peerId || !agentId) {
+          return null;
+        }
+        return { peerId, agentId };
+      })
+      .filter(Boolean);
+  }
+
+  if (!isObject(bindings)) {
+    return [];
+  }
+
+  return Object.entries(bindings)
+    .map(([peerId, agentId]) => {
+      const finalPeerId = typeof peerId === "string" ? peerId.trim() : "";
+      const finalAgentId = typeof agentId === "string" ? agentId.trim() : "";
+      if (!finalPeerId || !finalAgentId) {
+        return null;
+      }
+      return {
+        peerId: finalPeerId,
+        agentId: finalAgentId
+      };
+    })
+    .filter(Boolean);
+}
+
+function resolvePrimaryModelRef(config) {
+  const primary = typeof config?.model?.primary === "string" ? config.model.primary.trim() : "";
+  if (primary) {
+    return primary;
+  }
+
+  if (isObject(config?.models)) {
+    const first = Object.keys(config.models).find(Boolean);
+    if (first) {
+      return first;
+    }
+  }
+
+  return "";
+}
+
+function splitModelRef(modelRef) {
+  const normalized = String(modelRef || "").trim();
+  const slashIndex = normalized.indexOf("/");
+  if (!normalized || slashIndex <= 0 || slashIndex === normalized.length - 1) {
+    return { provider: undefined, model: undefined };
+  }
+  return {
+    provider: normalized.slice(0, slashIndex),
+    model: normalized.slice(slashIndex + 1)
+  };
+}
+
+function findPackageRoot(startDir, name) {
+  let dir = startDir;
+  for (;;) {
+    const pkgPath = path.join(dir, "package.json");
+    try {
+      if (fs.existsSync(pkgPath)) {
+        const raw = fs.readFileSync(pkgPath, "utf8");
+        const pkg = JSON.parse(raw);
+        if (pkg?.name === name) {
+          return dir;
+        }
+      }
+    } catch {
+      // ignore parse errors and keep walking
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      return null;
+    }
+    dir = parent;
+  }
+}
+
+function resolveOpenClawRoot() {
+  if (coreRootCache) {
+    return coreRootCache;
+  }
+
+  const override = process.env.OPENCLAW_ROOT?.trim();
+  if (override) {
+    coreRootCache = override;
+    return override;
+  }
+
+  const candidates = new Set();
+  if (process.argv[1]) {
+    candidates.add(path.dirname(process.argv[1]));
+  }
+  candidates.add(process.cwd());
+  try {
+    candidates.add(path.dirname(fileURLToPath(import.meta.url)));
+  } catch {
+    // ignore
+  }
+
+  for (const start of candidates) {
+    const found = findPackageRoot(start, "openclaw");
+    if (found) {
+      coreRootCache = found;
+      return found;
+    }
+  }
+
+  throw new Error("Unable to resolve OpenClaw root. Set OPENCLAW_ROOT to the package root.");
+}
+
+async function loadCoreAgentDeps() {
+  if (coreDepsPromise) {
+    return coreDepsPromise;
+  }
+
+  coreDepsPromise = (async () => {
+    const distPath = path.join(resolveOpenClawRoot(), "dist", "extensionAPI.js");
+    if (!fs.existsSync(distPath)) {
+      throw new Error(
+        `Missing core module at ${distPath}. Run \`pnpm build\` or install the official package.`
+      );
+    }
+    return await import(pathToFileURL(distPath).href);
+  })();
+
+  return coreDepsPromise;
+}
 export class XiaozhiAgentRouter {
   constructor(api, overrides, sessionTargets, hooks = {}) {
     this.api = api;
@@ -81,6 +231,59 @@ export class XiaozhiAgentRouter {
     };
   }
 
+  async getInventory(params) {
+    const cfg = this.api.runtime.config.loadConfig();
+    const accountId = params.account || "default";
+    const accountConfig = this.resolveAccountConfig(cfg, accountId);
+    const agents = this.listAgentOptions(cfg);
+    const defaultAgentId =
+      accountConfig?.defaultAgentId ??
+      cfg?.channels?.xiaozhi?.defaultAgentId ??
+      this.resolveFallbackAgentId(cfg);
+
+    return {
+      ok: true,
+      accountId,
+      runtimeAccount: {
+        value: accountId,
+        label: accountConfig?.name || accountConfig?.bridgeId || accountId
+      },
+      bridgeId: accountConfig?.bridgeId || null,
+      defaultAgentId,
+      agents,
+      staticBindings: normalizeBindingEntries(
+        accountConfig?.staticBindings ?? accountConfig?.bindings
+      )
+    };
+  }
+
+  async clearPeerSession(params) {
+    const accountId = params.account || "default";
+    const peerId =
+      params.peerId || params.deviceId || params.clientId || null;
+    const sessionId = params.sessionId || null;
+
+    if (peerId) {
+      this.overrides.delete(accountId, peerId);
+    }
+    if (sessionId) {
+      const key = this.buildSessionKey(accountId, sessionId);
+      this.sessions.delete(key);
+      this.sessionTargets?.deleteByXiaozhiSession(accountId, sessionId);
+    }
+
+    return {
+      ok: true,
+      account: accountId,
+      peerId,
+      sessionId,
+      cleared: {
+        runtimeOverride: Boolean(peerId),
+        session: Boolean(sessionId)
+      }
+    };
+  }
+
   async routeChat(params) {
     const cfg = this.api.runtime.config.loadConfig();
     const accountId = params.account || "default";
@@ -88,6 +291,7 @@ export class XiaozhiAgentRouter {
     const resolved = this.resolveTargetAgent(cfg, accountId, accountConfig, params.peerId);
     const text = await this.runAgent({
       cfg,
+      agentConfig: resolved.agentConfig,
       agentId: resolved.agentId,
       agentName: resolved.agentName,
       accountId,
@@ -130,6 +334,37 @@ export class XiaozhiAgentRouter {
       this.resolveFallbackAgentId(cfg);
     const selectedAgentId = runtimeOverride || staticBinding || defaultAgentId;
     return this.resolveAgentConfig(cfg, selectedAgentId);
+  }
+
+  listAgentOptions(cfg) {
+    const agents = Array.isArray(cfg?.agents?.list) ? cfg.agents.list : [];
+    if (agents.length === 0) {
+      const fallbackAgentId = this.resolveFallbackAgentId(cfg);
+      return fallbackAgentId
+        ? [{ value: fallbackAgentId, label: fallbackAgentId }]
+        : [];
+    }
+
+    return agents
+      .map((agent) => {
+        const value =
+          typeof agent?.id === "string" && agent.id.trim()
+            ? agent.id.trim()
+            : typeof agent?.name === "string" && agent.name.trim()
+              ? agent.name.trim()
+              : "";
+        if (!value) {
+          return null;
+        }
+        return {
+          value,
+          label:
+            (typeof agent?.name === "string" && agent.name.trim()) ||
+            (typeof agent?.label === "string" && agent.label.trim()) ||
+            value
+        };
+      })
+      .filter(Boolean);
   }
 
   resolveFallbackAgentId(cfg) {
@@ -231,6 +466,7 @@ export class XiaozhiAgentRouter {
 
   async runAgent({
     cfg,
+    agentConfig,
     agentId,
     agentName,
     accountId,
@@ -239,15 +475,27 @@ export class XiaozhiAgentRouter {
     speaker,
     sessionTarget
   }) {
+    const sessionId = sanitizeSessionId(
+      `xiaozhi-${accountId || "default"}-${agentId || DEFAULT_AGENT_ID}-${peerId || "peer"}`
+    );
     const channelRuntime = this.api.runtime?.channel;
-    if (
-      !channelRuntime?.routing?.resolveAgentRoute ||
-      !channelRuntime?.reply?.dispatchReplyWithBufferedBlockDispatcher ||
-      !channelRuntime?.reply?.finalizeInboundContext ||
-      !channelRuntime?.session?.resolveStorePath ||
-      !channelRuntime?.session?.recordInboundSession
-    ) {
-      throw new Error("OpenClaw channel runtime is unavailable for xiaozhi routing");
+    const canUseChannelRuntime =
+      channelRuntime?.routing?.resolveAgentRoute &&
+      channelRuntime?.reply?.dispatchReplyWithBufferedBlockDispatcher &&
+      channelRuntime?.reply?.finalizeInboundContext &&
+      channelRuntime?.session?.resolveStorePath &&
+      channelRuntime?.session?.recordInboundSession;
+
+    if (!canUseChannelRuntime) {
+      return await this.runEmbeddedAgentFallback({
+        cfg,
+        agentConfig,
+        agentId,
+        accountId,
+        peerId,
+        prompt,
+        sessionId
+      });
     }
 
     const routingCfg = this.buildRoutingConfig(cfg, {
@@ -376,8 +624,72 @@ export class XiaozhiAgentRouter {
     return "";
   }
 
+  async runEmbeddedAgentFallback({
+    cfg,
+    agentConfig,
+    agentId,
+    accountId,
+    peerId,
+    prompt,
+    sessionId
+  }) {
+    const runtimeAgent = this.api?.runtime?.agent;
+    const effectiveConfig = agentConfig ?? cfg;
+    const modelRef = resolvePrimaryModelRef(effectiveConfig);
+    const { provider, model } = splitModelRef(modelRef);
+
+    let result;
+    if (runtimeAgent?.ensureAgentWorkspace && runtimeAgent?.runEmbeddedPiAgent) {
+      await runtimeAgent.ensureAgentWorkspace(effectiveConfig);
+      const sessionFile = runtimeAgent.session.resolveSessionFilePath(effectiveConfig, sessionId);
+      const workspaceDir = runtimeAgent.resolveAgentWorkspaceDir(effectiveConfig);
+      const timeoutMs = runtimeAgent.resolveAgentTimeoutMs(effectiveConfig);
+      result = await runtimeAgent.runEmbeddedPiAgent({
+        sessionId,
+        runId: crypto.randomUUID(),
+        config: effectiveConfig,
+        sessionFile,
+        workspaceDir,
+        prompt,
+        timeoutMs,
+        provider,
+        model
+      });
+    } else {
+      const deps = await loadCoreAgentDeps();
+      const workspaceDir = deps.resolveAgentWorkspaceDir(cfg, agentId || DEFAULT_AGENT_ID);
+      const sessionFile = deps.resolveSessionFilePath(sessionId, undefined, {
+        agentId: agentId || DEFAULT_AGENT_ID
+      });
+      const agentDir = deps.resolveAgentDir(cfg, agentId || DEFAULT_AGENT_ID);
+      const timeoutMs = deps.resolveAgentTimeoutMs({ cfg });
+      const thinkLevel =
+        provider && model ? deps.resolveThinkingDefault({ cfg, provider, model }) : undefined;
+      await deps.ensureAgentWorkspace({ dir: workspaceDir });
+      result = await deps.runEmbeddedPiAgent({
+        sessionId,
+        sessionKey: `xiaozhi:${accountId || "default"}:${peerId || "peer"}`,
+        messageProvider: "xiaozhi",
+        runId: crypto.randomUUID(),
+        config: cfg,
+        sessionFile,
+        workspaceDir,
+        prompt,
+        timeoutMs,
+        agentDir,
+        lane: "default",
+        verboseLevel: "off",
+        provider,
+        model,
+        thinkLevel
+      });
+    }
+
+    return this.extractText(result);
+  }
+
   rememberSessionTarget(route, params) {
-    if (!this.sessionTargets || !route) {
+    if (!this.sessionTargets || !route || !params) {
       return;
     }
 
@@ -426,6 +738,16 @@ export class XiaozhiAgentRouter {
 
     if (isObject(result.payload)) {
       const nested = this.extractText(result.payload);
+      if (nested) {
+        return nested;
+      }
+    }
+    if (Array.isArray(result.payloads)) {
+      const nested = result.payloads
+        .filter((item) => !item?.isError)
+        .map((item) => this.extractText(item))
+        .filter(Boolean)
+        .join("\n");
       if (nested) {
         return nested;
       }

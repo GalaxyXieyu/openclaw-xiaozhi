@@ -12,7 +12,9 @@ const SUPPORTED_METHODS = new Set([
   "xiaozhi.sessionStarted",
   "xiaozhi.sessionEnded",
   "xiaozhi.chat",
-  "xiaozhi.bindPeerAgent"
+  "xiaozhi.bindPeerAgent",
+  "xiaozhi.inventory",
+  "xiaozhi.clearPeerSession"
 ]);
 
 function sleep(ms) {
@@ -191,6 +193,10 @@ class XiaozhiBridgeClient {
         result = await this.router.routeChat(params);
       } else if (method === "xiaozhi.bindPeerAgent") {
         result = await this.router.bindPeerAgent(params);
+      } else if (method === "xiaozhi.inventory") {
+        result = await this.router.getInventory(params);
+      } else if (method === "xiaozhi.clearPeerSession") {
+        result = await this.router.clearPeerSession(params);
       }
 
       if (id !== undefined) {

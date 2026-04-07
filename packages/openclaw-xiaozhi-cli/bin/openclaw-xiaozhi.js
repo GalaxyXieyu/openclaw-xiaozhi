@@ -50,6 +50,17 @@ async function promptValue(rl, label, fallback = "", { secret = false } = {}) {
   return value.trim() || fallback;
 }
 
+function hasValue(value) {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+async function resolveValue(rl, providedValue, label, fallback = "", promptOptions = {}) {
+  if (hasValue(providedValue)) {
+    return providedValue.trim();
+  }
+  return promptValue(rl, label, fallback, promptOptions);
+}
+
 function buildAdminUrl(serverUrl, path) {
   const url = new URL(serverUrl);
   url.protocol = url.protocol === "wss:" ? "https:" : url.protocol === "ws:" ? "http:" : url.protocol;
@@ -136,31 +147,33 @@ async function installCommand(options) {
   try {
     const accountId = options.account || DEFAULT_ACCOUNT_ID;
     assertSimpleAccountId(accountId);
-    const serverUrl = await promptValue(
+    const serverUrl = await resolveValue(
       rl,
-      "xiaozhi-server 地址",
-      options["server-url"] || ""
+      options["server-url"] || "",
+      "xiaozhi-server 地址"
     );
-    const adminKey = await promptValue(
+    const adminKey = await resolveValue(
       rl,
-      "admin key",
       options["admin-key"] || "",
+      "admin key",
+      "",
       { secret: true }
     );
-    const defaultAgentId = await promptValue(
+    const defaultAgentId = await resolveValue(
       rl,
-      "默认 agentId",
-      options["default-agent-id"] || ""
+      options["default-agent-id"] || "",
+      "默认 agentId"
     );
-    const bridgeName = await promptValue(
+    const bridgeName = await resolveValue(
       rl,
+      options.name || "",
       "bridge 名称",
-      options.name || `xiaozhi-${accountId}`
+      `xiaozhi-${accountId}`
     );
-    const bridgeId = await promptValue(
+    const bridgeId = await resolveValue(
       rl,
-      "bridgeId（留空自动生成）",
-      options["bridge-id"] || ""
+      options["bridge-id"] || "",
+      "bridgeId（留空自动生成）"
     );
 
     const pluginSpec = options["plugin-spec"] || DEFAULT_PLUGIN_SPEC;
@@ -259,10 +272,11 @@ async function unbindCommand(options) {
         "get",
         `channels.xiaozhi.accounts.${accountId}.bridgeId`
       ]);
-    const adminKey = await promptValue(
+    const adminKey = await resolveValue(
       rl,
-      "admin key",
       options["admin-key"] || "",
+      "admin key",
+      "",
       { secret: true }
     );
 
