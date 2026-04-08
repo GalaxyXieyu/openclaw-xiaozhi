@@ -1,4 +1,4 @@
-import { DEFAULT_ACCOUNT_ID, getChatChannelMeta } from "openclaw/plugin-sdk";
+const DEFAULT_ACCOUNT_ID = "default";
 
 function resolveChannelSection(cfg) {
   return cfg?.channels?.xiaozhi ?? {};
@@ -28,8 +28,9 @@ function normalizeAccountConfig(accountId, section) {
 }
 
 const meta = {
-  ...getChatChannelMeta("xiaozhi"),
+  id: "xiaozhi",
   label: "Xiaozhi",
+  selectionLabel: "Xiaozhi",
   blurb: "Bridge xiaozhi-server to OpenClaw over outbound WebSocket."
 };
 

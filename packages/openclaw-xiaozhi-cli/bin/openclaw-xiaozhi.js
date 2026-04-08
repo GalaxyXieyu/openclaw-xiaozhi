@@ -138,6 +138,93 @@ function cleanupExistingPlugin(pluginId = "xiaozhi") {
   }
 }
 
+function resolveOpenClawPackageDir() {
+  const whichCommand = process.platform === "win32" ? "where" : "which";
+  const whichResult = spawnSync(whichCommand, ["openclaw"], {
+    encoding: "utf-8"
+  });
+  if (whichResult.status !== 0) {
+    return "";
+  }
+
+  const binaries = whichResult.stdout
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  for (const binary of binaries) {
+    let realBinary = binary;
+    try {
+      realBinary = fs.realpathSync(binary);
+    } catch {
+      // ignore and keep the original path
+    }
+
+    const candidateDirs = [
+      path.resolve(path.dirname(realBinary), "..", "lib", "node_modules", "openclaw"),
+      path.resolve(path.dirname(realBinary), "..", "..", "lib", "node_modules", "openclaw"),
+      path.resolve(path.dirname(realBinary), "..", "node_modules", "openclaw")
+    ];
+
+    for (const candidate of candidateDirs) {
+      const pkgPath = path.join(candidate, "package.json");
+      if (!fs.existsSync(pkgPath)) {
+        continue;
+      }
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+        if (pkg?.name === "openclaw") {
+          return candidate;
+        }
+      } catch {
+        // ignore malformed candidates
+      }
+    }
+  }
+
+  return "";
+}
+
+function canResolvePluginSdk(pluginDir) {
+  const result = spawnSync(
+    "node",
+    [
+      "--input-type=module",
+      "-e",
+      "import('openclaw/plugin-sdk').then(()=>process.exit(0)).catch(()=>process.exit(1))"
+    ],
+    {
+      cwd: pluginDir,
+      stdio: "ignore"
+    }
+  );
+  return result.status === 0;
+}
+
+function ensurePluginHostLink(pluginId = "xiaozhi") {
+  const pluginDir = resolvePluginDir(pluginId);
+  if (!fs.existsSync(pluginDir)) {
+    return false;
+  }
+  if (canResolvePluginSdk(pluginDir)) {
+    return true;
+  }
+
+  const openclawDir = resolveOpenClawPackageDir();
+  if (!openclawDir) {
+    return false;
+  }
+
+  const nodeModulesDir = path.join(pluginDir, "node_modules");
+  const linkPath = path.join(nodeModulesDir, "openclaw");
+  fs.mkdirSync(nodeModulesDir, { recursive: true });
+  if (fs.existsSync(linkPath)) {
+    fs.rmSync(linkPath, { recursive: true, force: true });
+  }
+  fs.symlinkSync(openclawDir, linkPath, "dir");
+  return canResolvePluginSdk(pluginDir);
+}
+
 function healConfigBeforeInstall() {
   runOpenClawBestEffort(["doctor", "--fix"]);
 }
@@ -180,6 +267,7 @@ async function installCommand(options) {
     healConfigBeforeInstall();
     cleanupExistingPlugin("xiaozhi");
     runOpenClaw(["plugins", "install", pluginSpec]);
+    const hostLinkReady = ensurePluginHostLink("xiaozhi");
     runOpenClaw(["plugins", "enable", "xiaozhi"]);
 
     const issued = await issueBridgeToken({
@@ -224,6 +312,9 @@ async function installCommand(options) {
     console.log(`account: ${accountId}`);
     console.log(`bridgeId: ${issued.bridge.bridgeId}`);
     console.log(`server: ${issued.bridgeWebSocketUrl}`);
+    if (!hostLinkReady) {
+      console.log("warning: 未能自动修复 openclaw/plugin-sdk 解析，请检查 OpenClaw 全局安装路径");
+    }
   } finally {
     rl.close();
   }
