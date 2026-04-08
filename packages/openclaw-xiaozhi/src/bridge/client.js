@@ -6,6 +6,8 @@ import { SessionTargetStore } from "../store/session-targets.js";
 
 const RECONNECT_MIN_MS = 1000;
 const RECONNECT_MAX_MS = 15000;
+const RECONNECT_STABLE_MS = 60000;
+const RECONNECT_JITTER_RATIO = 0.2;
 const REQUEST_TIMEOUT_MS = 30000;
 const XIAOZHI_CHANNEL_ID = "xiaozhi";
 const SUPPORTED_METHODS = new Set([
@@ -19,6 +21,12 @@ const SUPPORTED_METHODS = new Set([
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function applyReconnectJitter(delayMs) {
+  const jitterWindow = Math.max(250, Math.round(delayMs * RECONNECT_JITTER_RATIO));
+  const offset = Math.floor(Math.random() * (jitterWindow * 2 + 1)) - jitterWindow;
+  return Math.max(RECONNECT_MIN_MS, delayMs + offset);
 }
 
 function buildBridgeUrl(serverUrl, bridgeToken) {
@@ -76,17 +84,21 @@ class XiaozhiBridgeClient {
   async runLoop() {
     let delayMs = RECONNECT_MIN_MS;
     while (!this.stopped) {
+      let session = null;
       try {
-        await this.connectOnce();
-        delayMs = RECONNECT_MIN_MS;
+        session = await this.connectOnce();
+        if (this.isStableSession(session)) {
+          delayMs = RECONNECT_MIN_MS;
+        }
       } catch (error) {
         this.api.logger.error(
           `[xiaozhi] bridge loop error ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}: ${normalizeError(error).message}`
         );
       }
       if (!this.stopped) {
-        await sleep(delayMs);
-        delayMs = Math.min(delayMs * 2, RECONNECT_MAX_MS);
+        const nextDelayMs = this.getNextReconnectDelay(delayMs, session);
+        await sleep(applyReconnectJitter(nextDelayMs));
+        delayMs = nextDelayMs;
       }
     }
   }
@@ -96,7 +108,8 @@ class XiaozhiBridgeClient {
       this.accountConfig.serverUrl,
       this.accountConfig.bridgeToken
     );
-    await new Promise((resolve) => {
+    return await new Promise((resolve) => {
+      let openedAt = 0;
       const socket = new WebSocket(url, {
         headers: this.accountConfig.bridgeToken
           ? { Authorization: `Bearer ${this.accountConfig.bridgeToken}` }
@@ -105,6 +118,7 @@ class XiaozhiBridgeClient {
       this.socket = socket;
 
       socket.on("open", () => {
+        openedAt = Date.now();
         this.api.logger.info(
           `[xiaozhi] bridge connected ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}`
         );
@@ -128,6 +142,7 @@ class XiaozhiBridgeClient {
       });
 
       socket.on("close", (code, reason) => {
+        const closedAt = Date.now();
         this.api.logger.warn(
           `[xiaozhi] bridge closed ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)} code=${code} reason=${reason.toString()}`
         );
@@ -139,9 +154,31 @@ class XiaozhiBridgeClient {
         }
         this.pendingResults.clear();
         this.socket = null;
-        resolve();
+        resolve({
+          code,
+          reason: reason.toString(),
+          openedAt,
+          closedAt
+        });
       });
     });
+  }
+
+  isStableSession(session) {
+    if (!session || !session.openedAt || !session.closedAt) {
+      return false;
+    }
+    return session.closedAt - session.openedAt >= RECONNECT_STABLE_MS;
+  }
+
+  getNextReconnectDelay(currentDelayMs, session) {
+    if (this.isStableSession(session)) {
+      return RECONNECT_MIN_MS;
+    }
+    return Math.min(
+      Math.max(currentDelayMs * 2, RECONNECT_MIN_MS),
+      RECONNECT_MAX_MS
+    );
   }
 
   async handlePayload(payload) {
