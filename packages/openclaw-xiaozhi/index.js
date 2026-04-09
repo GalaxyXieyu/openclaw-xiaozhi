@@ -26,6 +26,57 @@ function logHostWarning(api, message, error) {
   console.warn(`[xiaozhi] ${finalMessage}`);
 }
 
+function resolveOutboundPayload(args) {
+  const payloads = args.filter((item) => item && typeof item === "object");
+  if (!payloads.length) {
+    return {};
+  }
+
+  const outboundPayload =
+    payloads.find((item) =>
+      typeof item.text === "string" ||
+      typeof item.to === "string" ||
+      typeof item.accountId === "string"
+    ) ?? payloads[payloads.length - 1];
+
+  const contextPayload =
+    payloads.find((item) => item !== outboundPayload) ?? {};
+
+  return {
+    ...contextPayload,
+    ...outboundPayload,
+    accountId:
+      outboundPayload.accountId ||
+      outboundPayload.account ||
+      contextPayload.accountId ||
+      contextPayload.account ||
+      "",
+    to:
+      outboundPayload.to ||
+      outboundPayload.peerId ||
+      contextPayload.to ||
+      contextPayload.peerId ||
+      "",
+    text:
+      outboundPayload.text ||
+      outboundPayload.message ||
+      contextPayload.text ||
+      ""
+  };
+}
+
+function createChannelPlugin(service) {
+  return {
+    ...xiaozhiChannelPlugin,
+    outbound: {
+      ...(xiaozhiChannelPlugin.outbound || {}),
+      sendText: async (...args) => {
+        return await service.sendOutboundText(resolveOutboundPayload(args));
+      }
+    }
+  };
+}
+
 export default {
   id: "xiaozhi",
   name: "Xiaozhi",
@@ -33,10 +84,11 @@ export default {
   configSchema: resolveEmptyPluginConfigSchema(),
   register(api) {
     const service = new XiaozhiBridgeService(api);
+    const channelPlugin = createChannelPlugin(service);
 
     try {
       if (typeof api?.registerChannel === "function") {
-        api.registerChannel({ plugin: xiaozhiChannelPlugin });
+        api.registerChannel({ plugin: channelPlugin });
       }
     } catch (error) {
       logHostWarning(api, "registerChannel 不兼容，跳过 channel 注册", error);

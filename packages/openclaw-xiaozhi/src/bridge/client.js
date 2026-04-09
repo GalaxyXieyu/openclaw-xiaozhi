@@ -550,6 +550,7 @@ export class XiaozhiBridgeService {
 
   markRouteSettled(route, text = "") {
     const normalizedText = this.normalizePushText(text);
+    const handledDebugSessions = new Set();
     for (const sessionKey of this.getRouteKeys(route)) {
       const state = this.ensureReplyState(sessionKey);
       if (!state) {
@@ -559,6 +560,79 @@ export class XiaozhiBridgeService {
       if (normalizedText) {
         state.lastImmediateText = normalizedText;
       }
+      const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
+      if (!debugSessionId || handledDebugSessions.has(debugSessionId) || !normalizedText) {
+        continue;
+      }
+      handledDebugSessions.add(debugSessionId);
+      this.finalizeDebugRoute({
+        debugSessionId,
+        sessionKey,
+        finalText: normalizedText,
+        state
+      }).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.api.logger.error(
+          `[xiaozhi] finalize debug route failed session=${sessionKey}: ${message}`
+        );
+        this.debugTraceStore.markFailed(debugSessionId, message);
+      });
+    }
+  }
+
+  async finalizeDebugRoute({ debugSessionId, sessionKey, finalText, state }) {
+    this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
+    if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
+      this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
+    }
+
+    const shouldPushToDevice = this.debugTraceStore.shouldPushToDevice(debugSessionId);
+    if (!shouldPushToDevice) {
+      this.debugTraceStore.finishIfPending(debugSessionId);
+      return;
+    }
+
+    const target = this.sessionTargets.get(sessionKey);
+    if (!target) {
+      this.debugTraceStore.recordDevicePushFailed(
+        debugSessionId,
+        "未找到当前调试会话对应的设备上下文。"
+      );
+      this.debugTraceStore.finishIfPending(debugSessionId);
+      return;
+    }
+
+    this.debugTraceStore.recordDevicePushStarted(debugSessionId);
+    try {
+      await this.pushText(
+        {
+          account: target.account,
+          sessionId: target.sessionId,
+          deviceId: target.deviceId,
+          peerId: target.peerId,
+          text: finalText
+        },
+        {
+          sessionKey,
+          agentAccountId: target.account,
+          requesterSenderId: target.peerId
+        }
+      );
+      if (state) {
+        state.lastPushedText = finalText;
+      }
+      this.debugTraceStore.recordDevicePushSucceeded(debugSessionId, {
+        sessionId: target.sessionId,
+        deviceId: target.deviceId,
+        peerId: target.peerId,
+        message: "结果已推送到当前设备。"
+      });
+      this.debugTraceStore.finishIfPending(debugSessionId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.debugTraceStore.recordDevicePushFailed(debugSessionId, message);
+      this.debugTraceStore.finishIfPending(debugSessionId);
+      throw error;
     }
   }
 
@@ -766,6 +840,34 @@ export class XiaozhiBridgeService {
       .replace(/^#{1,6}\s+/gmu, "")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  async sendOutboundText(params = {}) {
+    const text = typeof params?.text === "string" ? params.text.trim() : "";
+    const peerId = typeof params?.to === "string" ? params.to.trim() : "";
+    const accountId =
+      typeof params?.accountId === "string" && params.accountId.trim()
+        ? params.accountId.trim()
+        : "default";
+
+    if (!text) {
+      return { ok: true, skipped: true, reason: "empty-text" };
+    }
+    if (!peerId || peerId.startsWith("web-debug:")) {
+      return { ok: true, skipped: true, reason: "debug-session" };
+    }
+
+    return await this.pushText(
+      {
+        account: accountId,
+        peerId,
+        text
+      },
+      {
+        agentAccountId: accountId,
+        requesterSenderId: peerId
+      }
+    );
   }
 
   handleSubagentSpawned(event, ctx = {}) {

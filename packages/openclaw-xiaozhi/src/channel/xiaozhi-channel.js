@@ -4,12 +4,20 @@ function resolveChannelSection(cfg) {
   return cfg?.channels?.xiaozhi ?? {};
 }
 
+function resolveDefaultAccountId(section) {
+  if (hasText(section?.defaultAccountId)) {
+    return section.defaultAccountId.trim();
+  }
+  const ids = Object.keys(section?.accounts ?? {});
+  return ids[0] ?? DEFAULT_ACCOUNT_ID;
+}
+
 function listAccountIds(section) {
   const ids = Object.keys(section?.accounts ?? {});
   if (ids.length > 0) {
     return ids;
   }
-  return [section?.defaultAccountId ?? DEFAULT_ACCOUNT_ID];
+  return [resolveDefaultAccountId(section)];
 }
 
 function hasText(value) {
@@ -18,7 +26,7 @@ function hasText(value) {
 
 function normalizeAccountConfig(accountId, section) {
   const accounts = section?.accounts ?? {};
-  const fallbackAccountId = section?.defaultAccountId ?? DEFAULT_ACCOUNT_ID;
+  const fallbackAccountId = resolveDefaultAccountId(section);
   const resolvedAccountId = accountId ?? fallbackAccountId;
   const accountConfig = accounts?.[resolvedAccountId] ?? {};
   return {
@@ -68,7 +76,7 @@ export const xiaozhiChannelPlugin = {
       };
     },
     defaultAccountId(cfg) {
-      return resolveChannelSection(cfg)?.defaultAccountId ?? DEFAULT_ACCOUNT_ID;
+      return resolveDefaultAccountId(resolveChannelSection(cfg));
     },
     isEnabled(account) {
       return account?.enabled !== false;
