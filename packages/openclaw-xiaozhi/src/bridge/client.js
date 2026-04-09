@@ -643,11 +643,15 @@ export class XiaozhiBridgeService {
       return;
     }
 
+    const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
+    const state = this.replyState.get(sessionKey) ?? null;
+
     const channelId =
       typeof ctx?.channelId === "string" ? ctx.channelId.trim() : "";
     const messageProvider =
       typeof ctx?.messageProvider === "string" ? ctx.messageProvider.trim() : "";
     if (
+      !debugSessionId &&
       channelId !== XIAOZHI_CHANNEL_ID &&
       messageProvider !== XIAOZHI_CHANNEL_ID
     ) {
@@ -655,8 +659,6 @@ export class XiaozhiBridgeService {
     }
 
     const target = this.sessionTargets.get(sessionKey);
-    const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
-    const state = this.replyState.get(sessionKey) ?? null;
     if (!state?.isRouteRoot) {
       if (debugSessionId) {
         const finalText = this.normalizePushText(
@@ -668,6 +670,12 @@ export class XiaozhiBridgeService {
           agentName: this.resolveAgentName(event, ctx),
           summary: finalText || "子任务执行完成"
         });
+        if (finalText && finalText !== "NO_REPLY") {
+          this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
+          if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
+            this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
+          }
+        }
       }
       return;
     }
