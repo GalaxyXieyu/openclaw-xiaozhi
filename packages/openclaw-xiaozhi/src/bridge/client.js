@@ -1,6 +1,7 @@
 import WebSocket from "ws";
 
 import { XiaozhiAgentRouter } from "../router/agent-router.js";
+import { DebugTraceStore } from "../store/debug-trace-store.js";
 import { RuntimeOverrideStore } from "../store/runtime-overrides.js";
 import { SessionTargetStore } from "../store/session-targets.js";
 
@@ -16,7 +17,8 @@ const SUPPORTED_METHODS = new Set([
   "xiaozhi.chat",
   "xiaozhi.bindPeerAgent",
   "xiaozhi.inventory",
-  "xiaozhi.clearPeerSession"
+  "xiaozhi.clearPeerSession",
+  "xiaozhi.debugSessionGet"
 ]);
 
 function sleep(ms) {
@@ -234,6 +236,8 @@ class XiaozhiBridgeClient {
         result = await this.router.getInventory(params);
       } else if (method === "xiaozhi.clearPeerSession") {
         result = await this.router.clearPeerSession(params);
+      } else if (method === "xiaozhi.debugSessionGet") {
+        result = await this.router.getDebugSession(params);
       }
 
       if (id !== undefined) {
@@ -316,8 +320,9 @@ export class XiaozhiBridgeService {
     this.api = api;
     this.overrides = new RuntimeOverrideStore();
     this.sessionTargets = new SessionTargetStore();
+    this.debugTraceStore = new DebugTraceStore();
     this.replyState = new Map();
-    this.router = new XiaozhiAgentRouter(api, this.overrides, this.sessionTargets, {
+    this.router = new XiaozhiAgentRouter(api, this.overrides, this.sessionTargets, this.debugTraceStore, {
       onRouteStart: (route) => {
         this.markRouteStart(route);
       },
@@ -362,6 +367,7 @@ export class XiaozhiBridgeService {
     this.overrides.clear();
     this.sessionTargets.clear();
     this.replyState.clear();
+    this.debugTraceStore.clear();
   }
 
   createPushTextTool(ctx) {
@@ -575,16 +581,24 @@ export class XiaozhiBridgeService {
     }
 
     const target = this.sessionTargets.get(sessionKey);
-    if (!target) {
-      return;
-    }
-
+    const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
     const state = this.replyState.get(sessionKey) ?? null;
     if (!state?.isRouteRoot) {
+      if (debugSessionId) {
+        const finalText = this.normalizePushText(
+          this.extractFinalAssistantText(event?.messages)
+        );
+        this.debugTraceStore.recordSubagentCompleted(debugSessionId, {
+          sessionKey,
+          agentId: this.resolveAgentId(event, ctx),
+          agentName: this.resolveAgentName(event, ctx),
+          summary: finalText || "子任务执行完成"
+        });
+      }
       return;
     }
 
-    if (state?.activeSyncRuns > 0) {
+    if (state?.activeSyncRuns > 0 && !debugSessionId) {
       this.api.logger.info(
         `[xiaozhi] skip auto-push for active sync run session=${sessionKey}`
       );
@@ -595,19 +609,49 @@ export class XiaozhiBridgeService {
       this.extractFinalAssistantText(event?.messages)
     );
     if (!finalText || finalText === "NO_REPLY") {
+      if (debugSessionId) {
+        this.debugTraceStore.finishIfPending(debugSessionId);
+      }
       return;
+    }
+
+    if (debugSessionId) {
+      this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
+      if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
+        this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
+      }
     }
 
     if (
       finalText === state?.lastImmediateText ||
       finalText === state?.lastPushedText
     ) {
+      if (debugSessionId) {
+        this.debugTraceStore.finishIfPending(debugSessionId);
+      }
       this.api.logger.info(
         `[xiaozhi] skip duplicate auto-push session=${sessionKey}`
       );
       return;
     }
 
+    if (!target) {
+      if (debugSessionId) {
+        this.debugTraceStore.finishIfPending(debugSessionId);
+      }
+      return;
+    }
+
+    const shouldPushToDevice =
+      !debugSessionId || this.debugTraceStore.shouldPushToDevice(debugSessionId);
+    if (!shouldPushToDevice) {
+      this.debugTraceStore.finishIfPending(debugSessionId);
+      return;
+    }
+
+    if (debugSessionId) {
+      this.debugTraceStore.recordDevicePushStarted(debugSessionId);
+    }
     try {
       await this.pushText(
         {
@@ -626,11 +670,24 @@ export class XiaozhiBridgeService {
       if (state) {
         state.lastPushedText = finalText;
       }
+      if (debugSessionId) {
+        this.debugTraceStore.recordDevicePushSucceeded(debugSessionId, {
+          sessionId: target.sessionId,
+          deviceId: target.deviceId,
+          peerId: target.peerId,
+          message: "结果已推送到当前设备。"
+        });
+        this.debugTraceStore.finishIfPending(debugSessionId);
+      }
       this.api.logger.info(
         `[xiaozhi] auto-pushed async reply session=${sessionKey} peer=${target.peerId || ""}`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (debugSessionId) {
+        this.debugTraceStore.recordDevicePushFailed(debugSessionId, message);
+        this.debugTraceStore.finishIfPending(debugSessionId);
+      }
       this.api.logger.error(
         `[xiaozhi] auto-push failed session=${sessionKey}: ${message}`
       );
@@ -715,8 +772,21 @@ export class XiaozhiBridgeService {
     const sourceSessionKey = ctx?.requesterSessionKey || event?.requesterSessionKey;
     const childSessionKey = ctx?.childSessionKey || event?.childSessionKey;
     const inherited = this.sessionTargets.inherit(sourceSessionKey, childSessionKey);
+    const debugSessionId = this.debugTraceStore.inherit(sourceSessionKey, childSessionKey);
     if (!inherited) {
       return;
+    }
+    if (debugSessionId) {
+      this.debugTraceStore.recordSubagentSpawned(debugSessionId, {
+        sessionKey: childSessionKey,
+        agentId: this.resolveChildAgentId(event, ctx),
+        agentName: this.resolveChildAgentName(event, ctx),
+        message:
+          this.resolveChildAgentName(event, ctx) ||
+          this.resolveChildAgentId(event, ctx) ||
+          childSessionKey ||
+          "后台任务已启动"
+      });
     }
     this.api.logger.info(
       `[xiaozhi] inherited target requester=${sourceSessionKey || ""} child=${childSessionKey || ""} device=${inherited.deviceId || ""} peer=${inherited.peerId || ""}`
@@ -729,5 +799,46 @@ export class XiaozhiBridgeService {
     }
     this.sessionTargets.delete(ctx.sessionKey);
     this.replyState.delete(ctx.sessionKey);
+    this.debugTraceStore.clearSessionKeys(ctx.sessionKey);
+  }
+
+  resolveAgentId(event, ctx = {}) {
+    const candidates = [
+      ctx?.agentId,
+      ctx?.resolvedAgentId,
+      event?.agentId,
+      event?.resolvedAgentId
+    ];
+    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
+  }
+
+  resolveAgentName(event, ctx = {}) {
+    const candidates = [
+      ctx?.agentName,
+      ctx?.resolvedAgentName,
+      event?.agentName,
+      event?.resolvedAgentName
+    ];
+    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
+  }
+
+  resolveChildAgentId(event, ctx = {}) {
+    const candidates = [
+      ctx?.childAgentId,
+      event?.childAgentId,
+      ctx?.agentId,
+      event?.agentId
+    ];
+    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
+  }
+
+  resolveChildAgentName(event, ctx = {}) {
+    const candidates = [
+      ctx?.childAgentName,
+      event?.childAgentName,
+      ctx?.agentName,
+      event?.agentName
+    ];
+    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
   }
 }

@@ -177,10 +177,11 @@ async function loadCoreAgentDeps() {
   return coreDepsPromise;
 }
 export class XiaozhiAgentRouter {
-  constructor(api, overrides, sessionTargets, hooks = {}) {
+  constructor(api, overrides, sessionTargets, debugTraceStore, hooks = {}) {
     this.api = api;
     this.overrides = overrides;
     this.sessionTargets = sessionTargets;
+    this.debugTraceStore = debugTraceStore;
     this.hooks = hooks;
     this.sessions = new Map();
   }
@@ -289,6 +290,14 @@ export class XiaozhiAgentRouter {
     const accountId = params.account || "default";
     const accountConfig = this.resolveAccountConfig(cfg, accountId);
     const resolved = this.resolveTargetAgent(cfg, accountId, accountConfig, params.peerId);
+    if (Boolean(params?.deferReply) && params?.debugSessionId) {
+      return this.startDeferredDebugChat({
+        cfg,
+        resolved,
+        accountId,
+        params
+      });
+    }
     const text = await this.runAgent({
       cfg,
       agentConfig: resolved.agentConfig,
@@ -313,6 +322,22 @@ export class XiaozhiAgentRouter {
       agentId: resolved.agentId,
       agentName: resolved.agentName
     };
+  }
+
+  async getDebugSession(params) {
+    const debugSessionId =
+      typeof params?.debugSessionId === "string" ? params.debugSessionId.trim() : "";
+    if (!debugSessionId) {
+      throw new Error("debugSessionId required");
+    }
+    const snapshot = this.debugTraceStore?.getSnapshot(
+      debugSessionId,
+      Number(params?.sinceSeq || 0)
+    );
+    if (!snapshot) {
+      throw new Error(`debug session not found: ${debugSessionId}`);
+    }
+    return snapshot;
   }
 
   buildSessionKey(accountId, sessionId) {
@@ -473,7 +498,10 @@ export class XiaozhiAgentRouter {
     peerId,
     prompt,
     speaker,
-    sessionTarget
+    sessionTarget,
+    debugSessionId = "",
+    pushToDevice = false,
+    browserAudio = false
   }) {
     const sessionId = sanitizeSessionId(
       `xiaozhi-${accountId || "default"}-${agentId || DEFAULT_AGENT_ID}-${peerId || "peer"}`
@@ -514,6 +542,16 @@ export class XiaozhiAgentRouter {
     });
     this.hooks?.onRouteStart?.(route);
     this.rememberSessionTarget(route, sessionTarget);
+    if (debugSessionId && this.debugTraceStore) {
+      this.debugTraceStore.attachRoute(debugSessionId, route, {
+        account: accountId,
+        peerId,
+        agentId: route.agentId || agentId,
+        agentName: agentName || route.agentId,
+        pushToDevice,
+        browserAudio
+      });
+    }
     const ctx = this.buildInboundContext({
       route,
       accountId,
@@ -706,6 +744,69 @@ export class XiaozhiAgentRouter {
     if (typeof route.mainSessionKey === "string" && route.mainSessionKey) {
       this.sessionTargets.remember(route.mainSessionKey, target);
     }
+  }
+
+  startDeferredDebugChat({ cfg, resolved, accountId, params }) {
+    const debugSessionId = String(params.debugSessionId || "").trim();
+    const peerId = params.peerId;
+    const browserAudio = Boolean(params.browserAudio);
+    const pushToDevice = Boolean(params.pushToDevice);
+
+    this.debugTraceStore?.accept({
+      debugSessionId,
+      account: accountId,
+      bridgeId: params.bridgeId,
+      peerId,
+      agentId: resolved.agentId,
+      agentName: resolved.agentName,
+      pushToDevice,
+      browserAudio
+    });
+
+    Promise.resolve()
+      .then(async () => {
+        await this.runAgent({
+          cfg,
+          agentConfig: resolved.agentConfig,
+          agentId: resolved.agentId,
+          agentName: resolved.agentName,
+          accountId,
+          peerId,
+          prompt: params.text,
+          speaker: params.speaker ?? null,
+          sessionTarget: {
+            account: accountId,
+            sessionId: params.sessionId,
+            deviceId: params.deviceId,
+            clientId: params.clientId,
+            peerId: params.targetPeerId || undefined,
+            speaker: params.speaker ?? null
+          },
+          debugSessionId,
+          pushToDevice,
+          browserAudio
+        });
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.api.logger.error(
+          `[xiaozhi] deferred debug failed account=${accountId} peer=${peerId || "unknown"} session=${debugSessionId}: ${message}`
+        );
+        this.debugTraceStore?.markFailed(debugSessionId, message);
+      });
+
+    return {
+      ok: true,
+      accepted: true,
+      status: "accepted",
+      debugSessionId,
+      account: accountId,
+      peerId,
+      agentId: resolved.agentId,
+      agentName: resolved.agentName,
+      pushToDevice,
+      browserAudio
+    };
   }
 
   extractText(result) {
