@@ -1,6 +1,6 @@
 {
   "name": "@galaxyxieyu/openclaw-xiaozhi-cli",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "Installer CLI for the OpenClaw xiaozhi bridge plugin",
   "type": "module",
   "license": "MIT",
