@@ -127,6 +127,28 @@ function runOpenClawBestEffort(args) {
   return result.status === 0;
 }
 
+function parseJsonFromOutput(stdout) {
+  const lines = String(stdout || "").split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trimStart();
+    if (!trimmed) {
+      continue;
+    }
+    if (trimmed.startsWith("[plugins]")) {
+      continue;
+    }
+    if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+      continue;
+    }
+    return JSON.parse(lines.slice(index).join("\n"));
+  }
+  throw new Error("OpenClaw 未返回可解析的 JSON 输出");
+}
+
+function runOpenClawJson(args) {
+  return parseJsonFromOutput(runOpenClawCapture(args));
+}
+
 function resolvePluginDir(pluginId = "xiaozhi") {
   return path.join(os.homedir(), ".openclaw", "extensions", pluginId);
 }
@@ -185,6 +207,127 @@ function resolveOpenClawPackageDir() {
   return "";
 }
 
+function resolveOpenClawConfigPath() {
+  if (hasValue(process.env.OPENCLAW_CONFIG_PATH)) {
+    return path.resolve(process.env.OPENCLAW_CONFIG_PATH.trim());
+  }
+  return path.join(os.homedir(), ".openclaw", "openclaw.json");
+}
+
+function readConfigFile(configPath = resolveOpenClawConfigPath()) {
+  if (!fs.existsSync(configPath)) {
+    return {};
+  }
+  const raw = fs.readFileSync(configPath, "utf-8").trim();
+  if (!raw) {
+    return {};
+  }
+  return JSON.parse(raw);
+}
+
+function writeConfigFile(config, configPath = resolveOpenClawConfigPath()) {
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf-8");
+}
+
+function pruneEmptyObject(parent, key) {
+  if (!parent || typeof parent !== "object") {
+    return;
+  }
+  const value = parent[key];
+  if (
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === 0
+  ) {
+    delete parent[key];
+  }
+}
+
+function sanitizeXiaozhiConfig(pluginId = "xiaozhi") {
+  const configPath = resolveOpenClawConfigPath();
+  const config = readConfigFile(configPath);
+  let changed = false;
+
+  if (
+    config.channels &&
+    typeof config.channels === "object" &&
+    Object.prototype.hasOwnProperty.call(config.channels, pluginId)
+  ) {
+    delete config.channels[pluginId];
+    pruneEmptyObject(config, "channels");
+    changed = true;
+  }
+
+  if (config.plugins && typeof config.plugins === "object") {
+    if (Array.isArray(config.plugins.allow)) {
+      const nextAllow = config.plugins.allow.filter((item) => item !== pluginId);
+      if (nextAllow.length !== config.plugins.allow.length) {
+        if (nextAllow.length > 0) {
+          config.plugins.allow = nextAllow;
+        } else {
+          delete config.plugins.allow;
+        }
+        changed = true;
+      }
+    }
+
+    if (
+      config.plugins.entries &&
+      typeof config.plugins.entries === "object" &&
+      Object.prototype.hasOwnProperty.call(config.plugins.entries, pluginId)
+    ) {
+      delete config.plugins.entries[pluginId];
+      pruneEmptyObject(config.plugins, "entries");
+      changed = true;
+    }
+
+    if (
+      config.plugins.installs &&
+      typeof config.plugins.installs === "object" &&
+      Object.prototype.hasOwnProperty.call(config.plugins.installs, pluginId)
+    ) {
+      delete config.plugins.installs[pluginId];
+      pruneEmptyObject(config.plugins, "installs");
+      changed = true;
+    }
+
+    pruneEmptyObject(config, "plugins");
+  }
+
+  if (changed) {
+    writeConfigFile(config, configPath);
+  }
+
+  return { changed, configPath };
+}
+
+function upsertXiaozhiChannelConfig(accountId, accountConfig, pluginId = "xiaozhi") {
+  const configPath = resolveOpenClawConfigPath();
+  const config = readConfigFile(configPath);
+  const channels =
+    config.channels && typeof config.channels === "object" ? config.channels : {};
+  const currentSection =
+    channels[pluginId] && typeof channels[pluginId] === "object"
+      ? channels[pluginId]
+      : {};
+  const accounts =
+    currentSection.accounts && typeof currentSection.accounts === "object"
+      ? currentSection.accounts
+      : {};
+
+  accounts[accountId] = accountConfig;
+  channels[pluginId] = {
+    ...currentSection,
+    defaultAccountId: accountId,
+    accounts
+  };
+  config.channels = channels;
+  writeConfigFile(config, configPath);
+  return configPath;
+}
+
 function canResolvePluginSdk(pluginDir) {
   const result = spawnSync(
     "node",
@@ -229,6 +372,33 @@ function healConfigBeforeInstall() {
   runOpenClawBestEffort(["doctor", "--fix"]);
 }
 
+function getPluginInfo(pluginId = "xiaozhi") {
+  try {
+    return runOpenClawJson(["plugins", "info", pluginId, "--json"]);
+  } catch {
+    return null;
+  }
+}
+
+function assertPluginReady(pluginId = "xiaozhi") {
+  const info = getPluginInfo(pluginId);
+  if (info?.id === pluginId) {
+    return info;
+  }
+
+  const doctorOutput = tryRunOpenClawCapture(["plugins", "doctor"]);
+  const pluginDir = resolvePluginDir(pluginId);
+  const hints = [];
+  if (fs.existsSync(pluginDir)) {
+    hints.push(`extensionDir=${pluginDir}`);
+  }
+  if (doctorOutput) {
+    hints.push(`pluginsDoctor=${doctorOutput}`);
+  }
+  const details = hints.length > 0 ? `\n${hints.join("\n")}` : "";
+  throw new Error(`插件 ${pluginId} 安装后未被 OpenClaw 正确识别。${details}`);
+}
+
 async function installCommand(options) {
   const rl = createInterface({ input, output });
   try {
@@ -265,10 +435,15 @@ async function installCommand(options) {
 
     const pluginSpec = options["plugin-spec"] || DEFAULT_PLUGIN_SPEC;
     healConfigBeforeInstall();
+    sanitizeXiaozhiConfig("xiaozhi");
     cleanupExistingPlugin("xiaozhi");
-    runOpenClaw(["plugins", "install", pluginSpec]);
+    runOpenClaw(["plugins", "install", pluginSpec, "--pin"]);
     const hostLinkReady = ensurePluginHostLink("xiaozhi");
-    runOpenClaw(["plugins", "enable", "xiaozhi"]);
+    let pluginInfo = assertPluginReady("xiaozhi");
+    if (pluginInfo?.enabled === false) {
+      runOpenClaw(["plugins", "enable", "xiaozhi"]);
+      pluginInfo = assertPluginReady("xiaozhi");
+    }
 
     const issued = await issueBridgeToken({
       serverUrl,
@@ -288,20 +463,7 @@ async function installCommand(options) {
       staticBindings: {}
     };
 
-    runOpenClaw([
-      "config",
-      "set",
-      "channels.xiaozhi.defaultAccountId",
-      JSON.stringify(accountId),
-      "--strict-json"
-    ]);
-    runOpenClaw([
-      "config",
-      "set",
-      `channels.xiaozhi.accounts.${accountId}`,
-      JSON.stringify(accountConfig),
-      "--strict-json"
-    ]);
+    const configPath = upsertXiaozhiChannelConfig(accountId, accountConfig, "xiaozhi");
     if (!options["no-restart"]) {
       runOpenClaw(["gateway", "restart"]);
     }
@@ -312,6 +474,7 @@ async function installCommand(options) {
     console.log(`account: ${accountId}`);
     console.log(`bridgeId: ${issued.bridge.bridgeId}`);
     console.log(`server: ${issued.bridgeWebSocketUrl}`);
+    console.log(`config: ${configPath}`);
     if (!hostLinkReady) {
       console.log("warning: 未能自动修复 openclaw/plugin-sdk 解析，请检查 OpenClaw 全局安装路径");
     }
