@@ -659,6 +659,25 @@ export class XiaozhiBridgeService {
     }
 
     const target = this.sessionTargets.get(sessionKey);
+    const childSessionKeys = this.extractSpawnedChildSessionKeys(event?.messages);
+    if (debugSessionId && state?.isRouteRoot && childSessionKeys.length > 0) {
+      for (const childSessionKey of childSessionKeys) {
+        this.sessionTargets.inherit(sessionKey, childSessionKey);
+        const inheritedDebugSessionId = this.debugTraceStore.inherit(sessionKey, childSessionKey);
+        if (inheritedDebugSessionId) {
+          this.debugTraceStore.recordSubagentSpawned(inheritedDebugSessionId, {
+            sessionKey: childSessionKey,
+            message: childSessionKey
+          });
+          const record = this.debugTraceStore.ensureSession({ debugSessionId: inheritedDebugSessionId });
+          if (record) {
+            record.pending = true;
+            record.status = "running";
+            record.updatedAt = Date.now();
+          }
+        }
+      }
+    }
     if (!state?.isRouteRoot) {
       if (debugSessionId) {
         const finalText = this.normalizePushText(
@@ -675,6 +694,7 @@ export class XiaozhiBridgeService {
           if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
             this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
           }
+          this.debugTraceStore.finishIfPending(debugSessionId);
         }
       }
       return;
@@ -1056,5 +1076,48 @@ export class XiaozhiBridgeService {
       event?.agentName
     ];
     return candidates.find((value) => typeof value === "string" && value.trim()) || "";
+  }
+
+  extractSpawnedChildSessionKeys(messages) {
+    if (!Array.isArray(messages)) {
+      return [];
+    }
+    const keys = new Set();
+    for (const entry of messages) {
+      const message =
+        entry && typeof entry === "object" && entry.message && typeof entry.message === "object"
+          ? entry.message
+          : entry;
+      if (!message || message.role !== "toolResult") {
+        continue;
+      }
+      if (message.toolName !== "sessions_spawn") {
+        continue;
+      }
+      const detailsKey =
+        typeof message.details?.childSessionKey === "string"
+          ? message.details.childSessionKey.trim()
+          : "";
+      if (detailsKey) {
+        keys.add(detailsKey);
+      }
+      const contents = Array.isArray(message.content) ? message.content : [];
+      for (const item of contents) {
+        if (!item || typeof item.text !== "string") {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(item.text);
+          const parsedKey =
+            typeof parsed?.childSessionKey === "string" ? parsed.childSessionKey.trim() : "";
+          if (parsedKey) {
+            keys.add(parsedKey);
+          }
+        } catch {
+          // ignore non-json tool result text
+        }
+      }
+    }
+    return [...keys];
   }
 }
