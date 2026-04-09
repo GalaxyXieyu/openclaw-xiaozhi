@@ -54,6 +54,12 @@ function hasValue(value) {
   return typeof value === "string" && value.trim() !== "";
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 async function resolveValue(rl, providedValue, label, fallback = "", promptOptions = {}) {
   if (hasValue(providedValue)) {
     return providedValue.trim();
@@ -380,10 +386,24 @@ function getPluginInfo(pluginId = "xiaozhi") {
   }
 }
 
-function assertPluginReady(pluginId = "xiaozhi") {
-  const info = getPluginInfo(pluginId);
-  if (info?.id === pluginId) {
-    return info;
+async function assertPluginReady(
+  pluginId = "xiaozhi",
+  { attempts = 8, delayMs = 1200 } = {}
+) {
+  let lastError = "";
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const info = runOpenClawJson(["plugins", "info", pluginId, "--json"]);
+      if (info?.id === pluginId) {
+        return info;
+      }
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error || "");
+    }
+
+    if (attempt < attempts) {
+      await sleep(delayMs);
+    }
   }
 
   const doctorOutput = tryRunOpenClawCapture(["plugins", "doctor"]);
@@ -394,6 +414,9 @@ function assertPluginReady(pluginId = "xiaozhi") {
   }
   if (doctorOutput) {
     hints.push(`pluginsDoctor=${doctorOutput}`);
+  }
+  if (lastError) {
+    hints.push(`lastError=${lastError}`);
   }
   const details = hints.length > 0 ? `\n${hints.join("\n")}` : "";
   throw new Error(`插件 ${pluginId} 安装后未被 OpenClaw 正确识别。${details}`);
@@ -439,10 +462,10 @@ async function installCommand(options) {
     cleanupExistingPlugin("xiaozhi");
     runOpenClaw(["plugins", "install", pluginSpec, "--pin"]);
     const hostLinkReady = ensurePluginHostLink("xiaozhi");
-    let pluginInfo = assertPluginReady("xiaozhi");
+    let pluginInfo = await assertPluginReady("xiaozhi");
     if (pluginInfo?.enabled === false) {
       runOpenClaw(["plugins", "enable", "xiaozhi"]);
-      pluginInfo = assertPluginReady("xiaozhi");
+      pluginInfo = await assertPluginReady("xiaozhi");
     }
 
     const issued = await issueBridgeToken({
