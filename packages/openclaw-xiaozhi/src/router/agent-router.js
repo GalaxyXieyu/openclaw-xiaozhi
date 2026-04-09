@@ -551,6 +551,9 @@ export class XiaozhiAgentRouter {
         pushToDevice,
         browserAudio
       });
+      this.api.logger.info(
+        `[xiaozhi][debug] attach_route debug=${debugSessionId} session=${route.sessionKey || ""} main=${route.mainSessionKey || ""}`
+      );
     }
     const ctx = this.buildInboundContext({
       route,

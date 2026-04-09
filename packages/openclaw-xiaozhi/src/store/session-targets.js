@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 function normalizeTarget(target) {
   if (!target || typeof target !== "object") {
     return null;
@@ -28,22 +32,73 @@ function normalizeTarget(target) {
   };
 }
 
+function resolveStateFile() {
+  const baseDir =
+    (typeof process.env.OPENCLAW_STATE_DIR === "string" && process.env.OPENCLAW_STATE_DIR.trim()) ||
+    path.join(os.homedir(), ".openclaw");
+  const dir = path.join(baseDir, "cache", "xiaozhi");
+  fs.mkdirSync(dir, { recursive: true });
+  return path.join(dir, "session-targets.json");
+}
+
 export class SessionTargetStore {
   constructor() {
+    this.stateFile = resolveStateFile();
     this.targets = new Map();
+    this.loadFromDisk();
+  }
+
+  loadFromDisk() {
+    if (!fs.existsSync(this.stateFile)) {
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(this.stateFile, "utf8");
+      if (!raw.trim()) {
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      this.targets = new Map(
+        (Array.isArray(parsed?.targets) ? parsed.targets : [])
+          .map((item) => {
+            const key = typeof item?.sessionKey === "string" ? item.sessionKey.trim() : "";
+            const target = normalizeTarget(item?.target);
+            if (!key || !target) {
+              return null;
+            }
+            return [key, target];
+          })
+          .filter(Boolean)
+      );
+    } catch {
+      // ignore corrupted cache and keep in-memory state
+    }
+  }
+
+  persistToDisk() {
+    const payload = {
+      targets: [...this.targets.entries()].map(([sessionKey, target]) => ({
+        sessionKey,
+        target
+      }))
+    };
+    fs.writeFileSync(this.stateFile, JSON.stringify(payload), "utf8");
   }
 
   remember(sessionKey, target) {
+    this.loadFromDisk();
     const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
     const normalized = normalizeTarget(target);
     if (!key || !normalized) {
       return null;
     }
     this.targets.set(key, normalized);
+    this.persistToDisk();
     return normalized;
   }
 
   get(sessionKey) {
+    this.loadFromDisk();
     const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
     if (!key) {
       return null;
@@ -52,6 +107,7 @@ export class SessionTargetStore {
   }
 
   inherit(sourceSessionKey, targetSessionKey) {
+    this.loadFromDisk();
     const source = this.get(sourceSessionKey);
     if (!source) {
       return null;
@@ -60,14 +116,17 @@ export class SessionTargetStore {
   }
 
   delete(sessionKey) {
+    this.loadFromDisk();
     const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
     if (!key) {
       return;
     }
     this.targets.delete(key);
+    this.persistToDisk();
   }
 
   deleteByXiaozhiSession(account, sessionId) {
+    this.loadFromDisk();
     const accountId =
       typeof account === "string" && account.trim() ? account.trim() : "default";
     const xiaozhiSessionId =
@@ -84,9 +143,11 @@ export class SessionTargetStore {
         this.targets.delete(sessionKey);
       }
     }
+    this.persistToDisk();
   }
 
   clear() {
     this.targets.clear();
+    this.persistToDisk();
   }
 }

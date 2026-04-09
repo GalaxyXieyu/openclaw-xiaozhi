@@ -530,6 +530,7 @@ export class XiaozhiBridgeService {
       {
         isRouteRoot: false,
         activeSyncRuns: 0,
+        awaitingChildResult: false,
         lastImmediateText: "",
         lastPushedText: ""
       };
@@ -565,17 +566,14 @@ export class XiaozhiBridgeService {
         continue;
       }
       handledDebugSessions.add(debugSessionId);
-      this.finalizeDebugRoute({
-        debugSessionId,
+      this.api.logger.info(
+        `[xiaozhi][debug] route settled session=${sessionKey} debug=${debugSessionId} text=${JSON.stringify(normalizedText.slice(0, 120))}`
+      );
+      this.debugTraceStore.recordProgress(debugSessionId, {
         sessionKey,
-        finalText: normalizedText,
-        state
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        this.api.logger.error(
-          `[xiaozhi] finalize debug route failed session=${sessionKey}: ${message}`
-        );
-        this.debugTraceStore.markFailed(debugSessionId, message);
+        agentId: route?.agentId || "",
+        agentName: route?.agentName || route?.agentId || "",
+        message: normalizedText
       });
     }
   }
@@ -644,7 +642,13 @@ export class XiaozhiBridgeService {
     }
 
     const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
-    const state = this.replyState.get(sessionKey) ?? null;
+    const inferredRootSession = !sessionKey.includes(":subagent:");
+    const state = debugSessionId
+      ? (this.ensureReplyState(sessionKey) ?? null)
+      : (this.replyState.get(sessionKey) ?? null);
+    if (state && inferredRootSession) {
+      state.isRouteRoot = true;
+    }
 
     const channelId =
       typeof ctx?.channelId === "string" ? ctx.channelId.trim() : "";
@@ -660,7 +664,14 @@ export class XiaozhiBridgeService {
 
     const target = this.sessionTargets.get(sessionKey);
     const childSessionKeys = this.extractSpawnedChildSessionKeys(event?.messages);
+    const hasChildCompletionEvent = this.hasChildCompletionEvent(event?.messages);
+    if (debugSessionId) {
+      this.api.logger.info(
+        `[xiaozhi][debug] agent_end session=${sessionKey} debug=${debugSessionId} root=${state?.isRouteRoot ? "yes" : "no"} inferredRoot=${inferredRootSession ? "yes" : "no"} children=${childSessionKeys.length} childDone=${hasChildCompletionEvent ? "yes" : "no"} channel=${channelId || "-"} provider=${messageProvider || "-"}`
+      );
+    }
     if (debugSessionId && state?.isRouteRoot && childSessionKeys.length > 0) {
+      state.awaitingChildResult = true;
       for (const childSessionKey of childSessionKeys) {
         this.sessionTargets.inherit(sessionKey, childSessionKey);
         const inheritedDebugSessionId = this.debugTraceStore.inherit(sessionKey, childSessionKey);
@@ -678,6 +689,9 @@ export class XiaozhiBridgeService {
         }
       }
     }
+    if (debugSessionId && state?.isRouteRoot && childSessionKeys.length > 0 && !hasChildCompletionEvent) {
+      return;
+    }
     if (!state?.isRouteRoot) {
       if (debugSessionId) {
         const finalText = this.normalizePushText(
@@ -689,13 +703,6 @@ export class XiaozhiBridgeService {
           agentName: this.resolveAgentName(event, ctx),
           summary: finalText || "子任务执行完成"
         });
-        if (finalText && finalText !== "NO_REPLY") {
-          this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
-          if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
-            this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
-          }
-          this.debugTraceStore.finishIfPending(debugSessionId);
-        }
       }
       return;
     }
@@ -712,11 +719,20 @@ export class XiaozhiBridgeService {
     );
     if (!finalText || finalText === "NO_REPLY") {
       if (debugSessionId) {
+        if (state?.awaitingChildResult || state?.lastImmediateText) {
+          this.api.logger.info(
+            `[xiaozhi] keep debug session pending after NO_REPLY session=${sessionKey}`
+          );
+          return;
+        }
         this.debugTraceStore.finishIfPending(debugSessionId);
       }
       return;
     }
 
+    if (state) {
+      state.awaitingChildResult = false;
+    }
     if (debugSessionId) {
       this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
       if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
@@ -870,6 +886,27 @@ export class XiaozhiBridgeService {
       .trim();
   }
 
+  hasChildCompletionEvent(messages) {
+    if (!Array.isArray(messages)) {
+      return false;
+    }
+    return messages.some((entry) => {
+      const message =
+        entry && typeof entry === "object" && entry.message && typeof entry.message === "object"
+          ? entry.message
+          : entry;
+      if (!message || typeof message !== "object") {
+        return false;
+      }
+      const provenance = message.provenance;
+      if (provenance && provenance.kind === "inter_session") {
+        return true;
+      }
+      const text = this.extractRichText(message.content ?? message.text ?? "");
+      return text.includes("[Internal task completion event]");
+    });
+  }
+
   resolveDebugSessionIdFromPeer(peerId) {
     const normalizedPeerId = typeof peerId === "string" ? peerId.trim() : "";
     if (!normalizedPeerId.startsWith("web-debug:")) {
@@ -1005,14 +1042,36 @@ export class XiaozhiBridgeService {
   }
 
   handleSubagentSpawned(event, ctx = {}) {
-    const sourceSessionKey = ctx?.requesterSessionKey || event?.requesterSessionKey;
+    const sourceCandidates = [
+      ctx?.requesterSessionKey,
+      event?.requesterSessionKey,
+      ctx?.requesterMainSessionKey,
+      event?.requesterMainSessionKey,
+      ctx?.mainSessionKey,
+      event?.mainSessionKey
+    ]
+      .filter((value) => typeof value === "string" && value.trim())
+      .map((value) => value.trim());
+    const sourceSessionKey = sourceCandidates[0] || "";
     const childSessionKey = ctx?.childSessionKey || event?.childSessionKey;
+    const sourceState = this.ensureReplyState(sourceSessionKey);
+    if (sourceState) {
+      sourceState.awaitingChildResult = true;
+    }
+    const sourceHasTarget = Boolean(this.sessionTargets.get(sourceSessionKey));
+    const sourceHasDebug = this.debugTraceStore.hasSessionKey(sourceSessionKey);
     const inherited = this.sessionTargets.inherit(sourceSessionKey, childSessionKey);
     const debugSessionId = this.debugTraceStore.inherit(sourceSessionKey, childSessionKey);
-    if (!inherited) {
-      return;
-    }
+    this.api.logger.info(
+      `[xiaozhi][debug] subagent_spawned sources=${JSON.stringify(sourceCandidates)} child=${childSessionKey || ""} debug=${debugSessionId || ""} inherited=${inherited ? "yes" : "no"} hasTarget=${sourceHasTarget ? "yes" : "no"} hasDebug=${sourceHasDebug ? "yes" : "no"} ctxKeys=${JSON.stringify(Object.keys(ctx || {}))} eventKeys=${JSON.stringify(Object.keys(event || {}))}`
+    );
     if (debugSessionId) {
+      const record = this.debugTraceStore.ensureSession({ debugSessionId });
+      if (record) {
+        record.pending = true;
+        record.status = "running";
+        record.updatedAt = Date.now();
+      }
       this.debugTraceStore.recordSubagentSpawned(debugSessionId, {
         sessionKey: childSessionKey,
         agentId: this.resolveChildAgentId(event, ctx),
@@ -1024,6 +1083,9 @@ export class XiaozhiBridgeService {
           "后台任务已启动"
       });
     }
+    if (!inherited) {
+      return;
+    }
     this.api.logger.info(
       `[xiaozhi] inherited target requester=${sourceSessionKey || ""} child=${childSessionKey || ""} device=${inherited.deviceId || ""} peer=${inherited.peerId || ""}`
     );
@@ -1032,6 +1094,21 @@ export class XiaozhiBridgeService {
   handleSessionEnded(ctx = {}) {
     if (!ctx?.sessionKey) {
       return;
+    }
+    const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(ctx.sessionKey);
+    const snapshot = debugSessionId
+      ? this.debugTraceStore.getSnapshot(debugSessionId)
+      : null;
+    if (debugSessionId && snapshot?.pending) {
+      this.api.logger.info(
+        `[xiaozhi][debug] preserve pending session on session_end session=${ctx.sessionKey} debug=${debugSessionId}`
+      );
+      return;
+    }
+    if (debugSessionId) {
+      this.api.logger.info(
+        `[xiaozhi][debug] session_end session=${ctx.sessionKey} debug=${debugSessionId}`
+      );
     }
     this.sessionTargets.delete(ctx.sessionKey);
     this.replyState.delete(ctx.sessionKey);
@@ -1079,45 +1156,60 @@ export class XiaozhiBridgeService {
   }
 
   extractSpawnedChildSessionKeys(messages) {
-    if (!Array.isArray(messages)) {
-      return [];
-    }
     const keys = new Set();
-    for (const entry of messages) {
-      const message =
-        entry && typeof entry === "object" && entry.message && typeof entry.message === "object"
-          ? entry.message
-          : entry;
-      if (!message || message.role !== "toolResult") {
-        continue;
+    const visited = new Set();
+    const visit = (value) => {
+      if (!value) {
+        return;
       }
-      if (message.toolName !== "sessions_spawn") {
-        continue;
-      }
-      const detailsKey =
-        typeof message.details?.childSessionKey === "string"
-          ? message.details.childSessionKey.trim()
-          : "";
-      if (detailsKey) {
-        keys.add(detailsKey);
-      }
-      const contents = Array.isArray(message.content) ? message.content : [];
-      for (const item of contents) {
-        if (!item || typeof item.text !== "string") {
-          continue;
-        }
+      if (typeof value === "string") {
         try {
-          const parsed = JSON.parse(item.text);
-          const parsedKey =
-            typeof parsed?.childSessionKey === "string" ? parsed.childSessionKey.trim() : "";
-          if (parsedKey) {
-            keys.add(parsedKey);
-          }
+          visit(JSON.parse(value));
         } catch {
-          // ignore non-json tool result text
+          // ignore non-json string payloads
+        }
+        return;
+      }
+      if (typeof value !== "object") {
+        return;
+      }
+      if (visited.has(value)) {
+        return;
+      }
+      visited.add(value);
+
+      const directKey =
+        typeof value.childSessionKey === "string" ? value.childSessionKey.trim() : "";
+      if (directKey) {
+        keys.add(directKey);
+      }
+
+      const toolName =
+        typeof value.toolName === "string"
+          ? value.toolName
+          : (typeof value.name === "string" ? value.name : "");
+      if (toolName === "sessions_spawn") {
+        const detailsKey =
+          typeof value.details?.childSessionKey === "string"
+            ? value.details.childSessionKey.trim()
+            : "";
+        if (detailsKey) {
+          keys.add(detailsKey);
         }
       }
-    }
+
+      if (Array.isArray(value)) {
+        for (const item of value) {
+          visit(item);
+        }
+        return;
+      }
+
+      for (const item of Object.values(value)) {
+        visit(item);
+      }
+    };
+    visit(messages);
     return [...keys];
   }
 }

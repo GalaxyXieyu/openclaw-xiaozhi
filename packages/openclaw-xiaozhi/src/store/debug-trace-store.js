@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 function cloneValue(value) {
   if (Array.isArray(value)) {
     return value.map((item) => cloneValue(item));
@@ -18,6 +22,41 @@ function normalizeDebugSessionId(value) {
 
 function normalizeSessionKey(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeReplyFingerprint(value) {
+  return typeof value === "string"
+    ? value
+      .replace(/\s+/g, " ")
+      .replace(/\s*([,.;:!?])\s*/g, "$1")
+      .trim()
+    : "";
+}
+
+function resolveStateDir() {
+  const baseDir =
+    (typeof process.env.OPENCLAW_STATE_DIR === "string" && process.env.OPENCLAW_STATE_DIR.trim()) ||
+    path.join(os.homedir(), ".openclaw");
+  const dir = path.join(baseDir, "cache", "xiaozhi");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function serializeRecord(record) {
+  return {
+    ...record,
+    routeKeys: [...(record.routeKeys || new Set())]
+  };
+}
+
+function deserializeRecord(record) {
+  if (!record || typeof record !== "object") {
+    return null;
+  }
+  return {
+    ...record,
+    routeKeys: new Set(Array.isArray(record.routeKeys) ? record.routeKeys : [])
+  };
 }
 
 function createEvent(record, event) {
@@ -72,11 +111,67 @@ function createRecord(meta = {}) {
 
 export class DebugTraceStore {
   constructor() {
+    this.stateFile = path.join(resolveStateDir(), "debug-trace-store.json");
     this.records = new Map();
     this.sessionToDebug = new Map();
+    this.loadFromDisk();
+  }
+
+  loadFromDisk() {
+    if (!fs.existsSync(this.stateFile)) {
+      return;
+    }
+    try {
+      const raw = fs.readFileSync(this.stateFile, "utf8");
+      if (!raw.trim()) {
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      this.records = new Map(
+        (Array.isArray(parsed?.records) ? parsed.records : [])
+          .map((item) => {
+            const next = deserializeRecord(item?.record);
+            const key = normalizeDebugSessionId(item?.debugSessionId);
+            if (!key || !next) {
+              return null;
+            }
+            return [key, next];
+          })
+          .filter(Boolean)
+      );
+      this.sessionToDebug = new Map(
+        (Array.isArray(parsed?.sessionToDebug) ? parsed.sessionToDebug : [])
+          .map((item) => {
+            const sessionKey = normalizeSessionKey(item?.sessionKey);
+            const debugSessionId = normalizeDebugSessionId(item?.debugSessionId);
+            if (!sessionKey || !debugSessionId) {
+              return null;
+            }
+            return [sessionKey, debugSessionId];
+          })
+          .filter(Boolean)
+      );
+    } catch {
+      // ignore corrupted cache and keep in-memory state
+    }
+  }
+
+  persistToDisk() {
+    const payload = {
+      records: [...this.records.entries()].map(([debugSessionId, record]) => ({
+        debugSessionId,
+        record: serializeRecord(record)
+      })),
+      sessionToDebug: [...this.sessionToDebug.entries()].map(([sessionKey, debugSessionId]) => ({
+        sessionKey,
+        debugSessionId
+      }))
+    };
+    fs.writeFileSync(this.stateFile, JSON.stringify(payload), "utf8");
   }
 
   ensureSession(meta = {}) {
+    this.loadFromDisk();
     const debugSessionId = normalizeDebugSessionId(meta.debugSessionId);
     if (!debugSessionId) {
       return null;
@@ -111,17 +206,23 @@ export class DebugTraceStore {
     }
     const record = createRecord(meta);
     this.records.set(debugSessionId, record);
+    this.persistToDisk();
     return record;
   }
 
   append(debugSessionId, event) {
-    const record = this.ensureSession({ debugSessionId });
+    const normalizedDebugSessionId = normalizeDebugSessionId(debugSessionId);
+    let record = this.records.get(normalizedDebugSessionId);
+    if (!record) {
+      record = this.ensureSession({ debugSessionId: normalizedDebugSessionId });
+    }
     if (!record) {
       return null;
     }
     const nextEvent = createEvent(record, event);
     record.events.push(nextEvent);
     record.updatedAt = Date.now();
+    this.persistToDisk();
     return nextEvent;
   }
 
@@ -143,6 +244,7 @@ export class DebugTraceStore {
   }
 
   attachRoute(debugSessionId, route, meta = {}) {
+    this.loadFromDisk();
     const record = this.ensureSession({ debugSessionId, ...meta });
     if (!record || !route) {
       return null;
@@ -165,10 +267,21 @@ export class DebugTraceStore {
       agentName: record.agentName,
       sessionKey: normalizeSessionKey(route.sessionKey)
     });
+    this.persistToDisk();
     return record;
   }
 
+  hasSessionKey(sessionKey) {
+    this.loadFromDisk();
+    const key = normalizeSessionKey(sessionKey);
+    if (!key) {
+      return false;
+    }
+    return this.sessionToDebug.has(key);
+  }
+
   inherit(sourceSessionKey, childSessionKey) {
+    this.loadFromDisk();
     const sourceKey = normalizeSessionKey(sourceSessionKey);
     const childKey = normalizeSessionKey(childSessionKey);
     if (!sourceKey || !childKey) {
@@ -185,10 +298,12 @@ export class DebugTraceStore {
     record.routeKeys.add(childKey);
     this.sessionToDebug.set(childKey, debugSessionId);
     record.updatedAt = Date.now();
+    this.persistToDisk();
     return debugSessionId;
   }
 
   getDebugSessionIdForSession(sessionKey) {
+    this.loadFromDisk();
     const key = normalizeSessionKey(sessionKey);
     if (!key) {
       return "";
@@ -197,16 +312,31 @@ export class DebugTraceStore {
   }
 
   shouldPushToDevice(debugSessionId) {
+    this.loadFromDisk();
     const record = this.records.get(normalizeDebugSessionId(debugSessionId));
     return Boolean(record?.pushToDevice);
   }
 
   shouldPrepareBrowserAudio(debugSessionId) {
+    this.loadFromDisk();
     const record = this.records.get(normalizeDebugSessionId(debugSessionId));
     return Boolean(record?.browserAudio?.enabled);
   }
 
   recordSubagentSpawned(debugSessionId, payload = {}) {
+    const record = this.ensureSession({ debugSessionId });
+    if (!record) {
+      return null;
+    }
+    const sessionKey = normalizeSessionKey(payload.sessionKey);
+    if (
+      sessionKey &&
+      record.events.some(
+        (event) => event.type === "subagent_spawned" && normalizeSessionKey(event.sessionKey) === sessionKey
+      )
+    ) {
+      return null;
+    }
     return this.append(debugSessionId, {
       type: "subagent_spawned",
       title: "Subagent 已启动",
@@ -219,6 +349,10 @@ export class DebugTraceStore {
   }
 
   recordSubagentCompleted(debugSessionId, payload = {}) {
+    const record = this.ensureSession({ debugSessionId });
+    if (!record) {
+      return null;
+    }
     return this.append(debugSessionId, {
       type: "subagent_completed",
       title: "Subagent 已完成",
@@ -230,16 +364,38 @@ export class DebugTraceStore {
     });
   }
 
+  recordProgress(debugSessionId, payload = {}) {
+    const record = this.ensureSession({ debugSessionId });
+    if (!record) {
+      return null;
+    }
+    record.status = "running";
+    record.pending = true;
+    record.updatedAt = Date.now();
+    return this.append(record.debugSessionId, {
+      type: "progress",
+      title: "处理中",
+      message: payload.message || "OpenClaw 正在继续处理",
+      agentId: payload.agentId || record.agentId,
+      agentName: payload.agentName || record.agentName,
+      sessionKey: payload.sessionKey,
+      payload
+    });
+  }
+
   recordReplyReady(debugSessionId, text) {
     const record = this.ensureSession({ debugSessionId });
     if (!record) {
       return null;
     }
     const normalizedText = typeof text === "string" ? text.trim() : "";
+    const normalizedFingerprint = normalizeReplyFingerprint(normalizedText);
     if (!normalizedText) {
       return null;
     }
-    if (record.latestReplyText === normalizedText) {
+    if (
+      normalizeReplyFingerprint(record.latestReplyText) === normalizedFingerprint
+    ) {
       return null;
     }
     record.latestReplyText = normalizedText;
@@ -341,6 +497,7 @@ export class DebugTraceStore {
   }
 
   markCompleted(debugSessionId) {
+    this.loadFromDisk();
     const record = this.ensureSession({ debugSessionId });
     if (!record) {
       return null;
@@ -356,6 +513,7 @@ export class DebugTraceStore {
   }
 
   markFailed(debugSessionId, message) {
+    this.loadFromDisk();
     const record = this.ensureSession({ debugSessionId });
     if (!record) {
       return null;
@@ -373,6 +531,7 @@ export class DebugTraceStore {
   }
 
   finishIfPending(debugSessionId) {
+    this.loadFromDisk();
     const record = this.records.get(normalizeDebugSessionId(debugSessionId));
     if (!record || !record.pending) {
       return null;
@@ -381,6 +540,7 @@ export class DebugTraceStore {
   }
 
   getSnapshot(debugSessionId, sinceSeq = 0) {
+    this.loadFromDisk();
     const record = this.records.get(normalizeDebugSessionId(debugSessionId));
     if (!record) {
       return null;
@@ -411,6 +571,7 @@ export class DebugTraceStore {
   }
 
   clearSessionKeys(sessionKey) {
+    this.loadFromDisk();
     const key = normalizeSessionKey(sessionKey);
     if (!key) {
       return;
@@ -421,10 +582,12 @@ export class DebugTraceStore {
         record.routeKeys.delete(key);
       }
     }
+    this.persistToDisk();
   }
 
   clear() {
     this.records.clear();
     this.sessionToDebug.clear();
+    this.persistToDisk();
   }
 }
