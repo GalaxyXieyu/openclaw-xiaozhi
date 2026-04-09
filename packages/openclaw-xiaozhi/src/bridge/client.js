@@ -842,6 +842,61 @@ export class XiaozhiBridgeService {
       .trim();
   }
 
+  resolveDebugSessionIdFromPeer(peerId) {
+    const normalizedPeerId = typeof peerId === "string" ? peerId.trim() : "";
+    if (!normalizedPeerId.startsWith("web-debug:")) {
+      return "";
+    }
+    return normalizedPeerId.slice("web-debug:".length).trim();
+  }
+
+  captureDebugOutboundResult(params = {}) {
+    const peerId = typeof params?.to === "string" ? params.to.trim() : "";
+    const debugSessionId = this.resolveDebugSessionIdFromPeer(peerId);
+    if (!debugSessionId) {
+      return null;
+    }
+
+    const accountId =
+      typeof params?.accountId === "string" && params.accountId.trim()
+        ? params.accountId.trim()
+        : "default";
+    const text = this.normalizePushText(
+      params?.text || params?.message || params?.caption || ""
+    );
+    const mediaItems = Array.isArray(params?.mediaItems)
+      ? params.mediaItems.filter(Boolean)
+      : [];
+
+    this.debugTraceStore.ensureSession({
+      debugSessionId,
+      account: accountId,
+      peerId
+    });
+
+    if (text) {
+      this.debugTraceStore.recordReplyReady(debugSessionId, text);
+      if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
+        this.debugTraceStore.recordBrowserAudioReady(debugSessionId, text);
+      }
+    } else if (mediaItems.length > 0) {
+      this.debugTraceStore.append(debugSessionId, {
+        type: "media_result_ready",
+        title: "结果附件已生成",
+        message: `当前结果包含 ${mediaItems.length} 个附件，调试面板暂只展示文字摘要。`
+      });
+    }
+
+    this.debugTraceStore.finishIfPending(debugSessionId);
+    return {
+      ok: true,
+      captured: true,
+      debugSessionId,
+      reason: "debug-session",
+      mediaCount: mediaItems.length
+    };
+  }
+
   async sendOutboundText(params = {}) {
     const text = typeof params?.text === "string" ? params.text.trim() : "";
     const peerId = typeof params?.to === "string" ? params.to.trim() : "";
@@ -853,8 +908,18 @@ export class XiaozhiBridgeService {
     if (!text) {
       return { ok: true, skipped: true, reason: "empty-text" };
     }
-    if (!peerId || peerId.startsWith("web-debug:")) {
-      return { ok: true, skipped: true, reason: "debug-session" };
+    if (!peerId) {
+      return { ok: true, skipped: true, reason: "missing-peer" };
+    }
+
+    const debugCapture = this.captureDebugOutboundResult({
+      ...params,
+      accountId,
+      to: peerId,
+      text
+    });
+    if (debugCapture) {
+      return debugCapture;
     }
 
     return await this.pushText(
@@ -868,6 +933,47 @@ export class XiaozhiBridgeService {
         requesterSenderId: peerId
       }
     );
+  }
+
+  async sendOutboundMedia(params = {}) {
+    const peerId = typeof params?.to === "string" ? params.to.trim() : "";
+    const accountId =
+      typeof params?.accountId === "string" && params.accountId.trim()
+        ? params.accountId.trim()
+        : "default";
+    const text = this.normalizePushText(
+      params?.text || params?.message || params?.caption || ""
+    );
+    const mediaItems = Array.isArray(params?.mediaItems)
+      ? params.mediaItems.filter(Boolean)
+      : [];
+
+    const debugCapture = this.captureDebugOutboundResult({
+      ...params,
+      accountId,
+      to: peerId,
+      text,
+      mediaItems
+    });
+    if (debugCapture) {
+      return debugCapture;
+    }
+
+    if (text) {
+      return await this.sendOutboundText({
+        ...params,
+        accountId,
+        to: peerId,
+        text
+      });
+    }
+
+    return {
+      ok: true,
+      skipped: true,
+      reason: "media-unsupported",
+      mediaDropped: mediaItems.length > 0
+    };
   }
 
   handleSubagentSpawned(event, ctx = {}) {

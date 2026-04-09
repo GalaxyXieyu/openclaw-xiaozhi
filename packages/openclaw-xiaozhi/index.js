@@ -42,6 +42,24 @@ function resolveOutboundPayload(args) {
   const contextPayload =
     payloads.find((item) => item !== outboundPayload) ?? {};
 
+  const rawMedia =
+    outboundPayload.mediaItems ||
+    outboundPayload.media ||
+    outboundPayload.attachments ||
+    contextPayload.mediaItems ||
+    contextPayload.media ||
+    contextPayload.attachments ||
+    [];
+  const mediaItems = Array.isArray(rawMedia)
+    ? rawMedia.filter(Boolean)
+    : (rawMedia ? [rawMedia] : []);
+  const caption =
+    outboundPayload.caption ||
+    outboundPayload.altText ||
+    contextPayload.caption ||
+    contextPayload.altText ||
+    "";
+
   return {
     ...contextPayload,
     ...outboundPayload,
@@ -60,8 +78,13 @@ function resolveOutboundPayload(args) {
     text:
       outboundPayload.text ||
       outboundPayload.message ||
+      outboundPayload.caption ||
       contextPayload.text ||
-      ""
+      contextPayload.message ||
+      caption ||
+      "",
+    caption,
+    mediaItems
   };
 }
 
@@ -72,6 +95,9 @@ function createChannelPlugin(service) {
       ...(xiaozhiChannelPlugin.outbound || {}),
       sendText: async (...args) => {
         return await service.sendOutboundText(resolveOutboundPayload(args));
+      },
+      sendMedia: async (...args) => {
+        return await service.sendOutboundMedia(resolveOutboundPayload(args));
       }
     }
   };
