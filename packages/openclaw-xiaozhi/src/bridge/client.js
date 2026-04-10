@@ -4,6 +4,7 @@ import { PendingPushStore } from "../store/pending-push-store.js";
 import { RuntimeOverrideStore } from "../store/runtime-overrides.js";
 import { SessionTargetStore } from "../store/session-targets.js";
 import { XiaozhiBridgeClient } from "./rpc-client.js";
+import { deliverDetailMessage } from "./detail-delivery.js";
 import { XiaozhiSessionRuntime } from "./session-runtime.js";
 
 const PENDING_PUSH_POLL_MS = 1500;
@@ -204,6 +205,49 @@ export class XiaozhiBridgeService {
     };
   }
 
+  createDeliverDetailTool(ctx) {
+    return {
+      name: "xiaozhi_deliver_detail",
+      label: "Xiaozhi Deliver Detail",
+      description:
+        "Send the detailed IM version of the current Xiaozhi result to the bound outbound channel. The channel/account/target come from the current session binding.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          title: {
+            type: "string",
+            description: "Optional detail title."
+          },
+          text: {
+            type: "string",
+            description: "Detailed text body."
+          },
+          format: {
+            type: "string",
+            description: "Optional format override, such as text or card."
+          },
+          mediaUrl: {
+            type: "string",
+            description: "Optional single media URL."
+          },
+          mediaUrls: {
+            type: "array",
+            items: {
+              type: "string"
+            },
+            description: "Optional media URLs. Only the first one is sent in v1."
+          },
+          card: {
+            type: ["object", "string"],
+            description: "Optional Adaptive Card JSON object or JSON string."
+          }
+        }
+      },
+      execute: async (_id, params) => this.deliverDetail(params, ctx)
+    };
+  }
+
   async pushText(params, ctx = {}) {
     const text = typeof params?.text === "string" ? params.text.trim() : "";
     if (!text) {
@@ -211,6 +255,19 @@ export class XiaozhiBridgeService {
     }
 
     return await this.dispatchPushText(params, ctx, true);
+  }
+
+  async deliverDetail(params, ctx = {}) {
+    const sessionTarget = this.sessionTargets.get(ctx?.sessionKey);
+    if (!sessionTarget?.deliveryBinding) {
+      throw new Error("当前会话没有可用的 IM 详细稿投递绑定");
+    }
+
+    return await deliverDetailMessage({
+      binding: sessionTarget.deliveryBinding,
+      params,
+      logger: this.api.logger
+    });
   }
 
   async setAsyncWaiting(params, ctx = {}) {

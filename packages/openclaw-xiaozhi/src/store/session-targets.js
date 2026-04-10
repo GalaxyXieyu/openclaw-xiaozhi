@@ -17,6 +17,7 @@ function normalizeTarget(target) {
     typeof target.clientId === "string" ? target.clientId.trim() : "";
   const speaker =
     typeof target.speaker === "string" ? target.speaker.trim() : "";
+  const deliveryBinding = normalizeDeliveryBinding(target.deliveryBinding);
 
   if (!sessionId && !deviceId && !peerId) {
     return null;
@@ -28,7 +29,41 @@ function normalizeTarget(target) {
     deviceId: deviceId || undefined,
     peerId: peerId || undefined,
     clientId: clientId || undefined,
-    speaker: speaker || undefined
+    speaker: speaker || undefined,
+    deliveryBinding: deliveryBinding || undefined
+  };
+}
+
+function normalizeDeliveryBinding(binding) {
+  if (!binding || typeof binding !== "object") {
+    return null;
+  }
+
+  const enabled = Boolean(binding.enabled);
+  const deliveryChannel =
+    typeof binding.deliveryChannel === "string" ? binding.deliveryChannel.trim() : "";
+  const accountId =
+    typeof binding.accountId === "string" ? binding.accountId.trim() : "";
+  const target =
+    typeof binding.target === "string" ? binding.target.trim() : "";
+  const threadId =
+    typeof binding.threadId === "string" ? binding.threadId.trim() : "";
+  const format =
+    typeof binding.format === "string" && binding.format.trim()
+      ? binding.format.trim()
+      : "text";
+
+  if (!enabled || !deliveryChannel || !target) {
+    return null;
+  }
+
+  return {
+    enabled: true,
+    deliveryChannel,
+    accountId: accountId || undefined,
+    target,
+    threadId: threadId || undefined,
+    format
   };
 }
 

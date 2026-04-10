@@ -127,8 +127,14 @@ export default {
       ) {
         api.registerTool((ctx) => service.createPushTextTool(ctx));
       }
+      if (
+        typeof api?.registerTool === "function" &&
+        typeof service.createDeliverDetailTool === "function"
+      ) {
+        api.registerTool((ctx) => service.createDeliverDetailTool(ctx));
+      }
     } catch (error) {
-      logHostWarning(api, "registerTool 不兼容，跳过 push text tool 注册", error);
+      logHostWarning(api, "registerTool 不兼容，跳过 xiaozhi tool 注册", error);
     }
 
     try {

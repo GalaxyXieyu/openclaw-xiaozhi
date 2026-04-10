@@ -7,6 +7,51 @@ import { resolveStaticBinding } from "../store/static-bindings.js";
 
 const DEFAULT_AGENT_ID = "main";
 const XIAOZHI_CHANNEL_ID = "xiaozhi";
+const INTERNAL_CHANNEL_IDS = new Set(["xiaozhi", "webchat"]);
+const DELIVERY_CHANNEL_META = {
+  wecom: {
+    label: "企业微信",
+    description: "适合把详细稿发到企业微信群或企业微信单聊。",
+    targetHint: "填写企业微信群 chatId 或企业微信用户 ID。",
+    targetPlaceholder: "例如 wrn-... 或 user:zhangsan"
+  },
+  feishu: {
+    label: "飞书",
+    description: "适合把详细稿发到飞书群聊或飞书单聊。",
+    targetHint: "填写飞书 chat_id（oc_*）或 open_id / user_id（ou_*）。",
+    targetPlaceholder: "例如 oc_xxx 或 ou_xxx"
+  },
+  "openclaw-lark": {
+    label: "飞书/Lark",
+    description: "适合把详细稿发到飞书群聊或飞书单聊。",
+    targetHint: "填写飞书 chat_id（oc_*）或 open_id / user_id（ou_*）。",
+    targetPlaceholder: "例如 oc_xxx 或 ou_xxx"
+  },
+  "openclaw-weixin": {
+    label: "微信",
+    description: "适合把详细稿发到微信侧会话，需要先确认目标账号和会话 target。",
+    targetHint: "填写该微信账号下可用的会话 target。",
+    targetPlaceholder: "例如具体会话 target"
+  },
+  slack: {
+    label: "Slack",
+    description: "适合把详细稿发到 Slack channel 或用户。",
+    targetHint: "填写 Slack channel / user 标识。",
+    targetPlaceholder: "例如 C123456 / U123456"
+  },
+  discord: {
+    label: "Discord",
+    description: "适合把详细稿发到 Discord 频道或用户。",
+    targetHint: "填写 Discord channel / user 标识。",
+    targetPlaceholder: "例如 1234567890"
+  },
+  telegram: {
+    label: "Telegram",
+    description: "适合把详细稿发到 Telegram 聊天或频道。",
+    targetHint: "填写 Telegram chat id 或 @username。",
+    targetPlaceholder: "例如 -100123456 或 @channel"
+  }
+};
 let coreRootCache = null;
 let coreDepsPromise = null;
 
@@ -73,6 +118,180 @@ function normalizeBindingEntries(bindings) {
       };
     })
     .filter(Boolean);
+}
+
+function normalizeCatalogOption(value, label, extra = {}) {
+  const finalValue = typeof value === "string" ? value.trim() : "";
+  const finalLabel = typeof label === "string" ? label.trim() : "";
+  if (!finalValue) {
+    return null;
+  }
+  return {
+    value: finalValue,
+    label: finalLabel || finalValue,
+    ...extra
+  };
+}
+
+function mergeOptionLists(baseOptions = [], nextOptions = []) {
+  const merged = [];
+  const seen = new Set();
+  for (const item of [...baseOptions, ...nextOptions]) {
+    if (!item || typeof item.value !== "string") {
+      continue;
+    }
+    const key = item.value.trim();
+    if (!key || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    merged.push(item);
+  }
+  return merged;
+}
+
+function resolveDeliveryChannelMeta(channelId) {
+  const normalized = typeof channelId === "string" ? channelId.trim() : "";
+  return DELIVERY_CHANNEL_META[normalized] || {
+    label: normalized || "未知渠道",
+    description: "把详细稿发到当前 OpenClaw 支持的 IM 渠道。",
+    targetHint: "填写该渠道要求的 target 标识。",
+    targetPlaceholder: "请输入 target"
+  };
+}
+
+function resolveConfiguredChannels(cfg) {
+  const discovered = new Set();
+  if (isObject(cfg?.channels)) {
+    for (const channelId of Object.keys(cfg.channels)) {
+      const normalized = String(channelId || "").trim();
+      if (!normalized || INTERNAL_CHANNEL_IDS.has(normalized)) {
+        continue;
+      }
+      discovered.add(normalized);
+    }
+  }
+
+  const routes = Array.isArray(cfg?.routing?.routes) ? cfg.routing.routes : [];
+  for (const route of routes) {
+    if (!isObject(route) || !isObject(route.match)) {
+      continue;
+    }
+    const normalized = typeof route.match.channel === "string" ? route.match.channel.trim() : "";
+    if (!normalized || INTERNAL_CHANNEL_IDS.has(normalized)) {
+      continue;
+    }
+    discovered.add(normalized);
+  }
+
+  return [...discovered];
+}
+
+function resolveFeishuSection(cfg, channelId) {
+  if (channelId === "openclaw-lark" && isObject(cfg?.channels?.feishu)) {
+    return cfg.channels.feishu;
+  }
+  if (isObject(cfg?.channels?.[channelId])) {
+    return cfg.channels[channelId];
+  }
+  if (channelId === "feishu" && isObject(cfg?.channels?.["openclaw-lark"])) {
+    return cfg.channels["openclaw-lark"];
+  }
+  return {};
+}
+
+function collectRouteAccountOptions(cfg, channelId) {
+  const routes = Array.isArray(cfg?.routing?.routes) ? cfg.routing.routes : [];
+  const options = [];
+  for (const route of routes) {
+    if (!isObject(route) || !isObject(route.match)) {
+      continue;
+    }
+    const routeChannel = typeof route.match.channel === "string" ? route.match.channel.trim() : "";
+    if (routeChannel !== channelId) {
+      continue;
+    }
+    const accountId = typeof route.match.accountId === "string" ? route.match.accountId.trim() : "";
+    if (!accountId) {
+      continue;
+    }
+    const agentLabel = typeof route.agentId === "string" ? route.agentId.trim() : "";
+    options.push(
+      normalizeCatalogOption(
+        accountId,
+        agentLabel ? `${accountId}（绑定 ${agentLabel}）` : accountId
+      )
+    );
+  }
+  return mergeOptionLists([], options.filter(Boolean));
+}
+
+function collectWeComTargetOptions(cfg) {
+  const groups = isObject(cfg?.channels?.wecom?.groups) ? cfg.channels.wecom.groups : {};
+  return Object.keys(groups)
+    .filter((item) => item && item !== "*")
+    .map((groupId) => normalizeCatalogOption(groupId, `企业微信群 ${groupId}`))
+    .filter(Boolean);
+}
+
+function collectFeishuTargetOptions(cfg, channelId) {
+  const section = resolveFeishuSection(cfg, channelId);
+  const options = [];
+  const groups = isObject(section?.groups) ? section.groups : {};
+  for (const groupId of Object.keys(groups)) {
+    if (!groupId || groupId === "*") {
+      continue;
+    }
+    options.push(normalizeCatalogOption(groupId, `飞书群聊 ${groupId}`));
+  }
+
+  const addUsers = (items, labelPrefix) => {
+    if (!Array.isArray(items)) {
+      return;
+    }
+    for (const item of items) {
+      const value = typeof item === "string" ? item.trim() : "";
+      if (!value || value === "*") {
+        continue;
+      }
+      options.push(normalizeCatalogOption(value, `${labelPrefix} ${value}`));
+    }
+  };
+
+  addUsers(section?.allowFrom, "飞书用户");
+  addUsers(section?.groupAllowFrom, "飞书用户");
+  return mergeOptionLists([], options.filter(Boolean));
+}
+
+function buildDeliveryChannelOption(cfg, channelId) {
+  const meta = resolveDeliveryChannelMeta(channelId);
+  const routeAccountOptions = collectRouteAccountOptions(cfg, channelId);
+  let accountOptions = routeAccountOptions;
+  let targetOptions = [];
+
+  if (channelId === "wecom") {
+    targetOptions = collectWeComTargetOptions(cfg);
+  } else if (channelId === "feishu" || channelId === "openclaw-lark") {
+    targetOptions = collectFeishuTargetOptions(cfg, channelId);
+  } else if (channelId === "openclaw-weixin") {
+    accountOptions = mergeOptionLists(accountOptions, routeAccountOptions);
+  }
+
+  return {
+    value: channelId,
+    label: meta.label,
+    description: meta.description,
+    targetHint: meta.targetHint,
+    targetPlaceholder: meta.targetPlaceholder,
+    accountOptions,
+    targetOptions
+  };
+}
+
+function buildDeliveryChannels(cfg) {
+  return resolveConfiguredChannels(cfg)
+    .map((channelId) => buildDeliveryChannelOption(cfg, channelId))
+    .filter((item) => item && item.value);
 }
 
 function resolvePrimaryModelRef(config) {
@@ -201,7 +420,8 @@ export class XiaozhiAgentRouter {
       peerId: params.peerId,
       deviceId: params.deviceId,
       clientId: params.clientId,
-      speaker: params.speaker ?? null
+      speaker: params.speaker ?? null,
+      deliveryBinding: params.deliveryBinding ?? null
     });
     return { ok: true };
   }
@@ -252,6 +472,7 @@ export class XiaozhiAgentRouter {
       bridgeId: accountConfig?.bridgeId || null,
       defaultAgentId,
       agents,
+      deliveryChannels: buildDeliveryChannels(cfg),
       staticBindings: normalizeBindingEntries(
         accountConfig?.staticBindings ?? accountConfig?.bindings
       )
@@ -313,7 +534,8 @@ export class XiaozhiAgentRouter {
         deviceId: params.deviceId,
         clientId: params.clientId,
         peerId: params.peerId,
-        speaker: params.speaker ?? null
+        speaker: params.speaker ?? null,
+        deliveryBinding: params.deliveryBinding ?? null
       }
     });
     return {
@@ -740,7 +962,8 @@ export class XiaozhiAgentRouter {
       deviceId: params.deviceId,
       clientId: params.clientId,
       peerId: params.peerId,
-      speaker: params.speaker ?? null
+      speaker: params.speaker ?? null,
+      deliveryBinding: params.deliveryBinding ?? null
     };
 
     this.sessionTargets.remember(route.sessionKey, target);
@@ -783,7 +1006,8 @@ export class XiaozhiAgentRouter {
             deviceId: params.deviceId,
             clientId: params.clientId,
             peerId: params.targetPeerId || undefined,
-            speaker: params.speaker ?? null
+            speaker: params.speaker ?? null,
+            deliveryBinding: params.deliveryBinding ?? null
           },
           debugSessionId,
           pushToDevice,
