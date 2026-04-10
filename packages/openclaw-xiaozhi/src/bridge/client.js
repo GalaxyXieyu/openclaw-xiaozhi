@@ -1,319 +1,12 @@
-import WebSocket from "ws";
-
 import { XiaozhiAgentRouter } from "../router/agent-router.js";
 import { DebugTraceStore } from "../store/debug-trace-store.js";
+import { PendingPushStore } from "../store/pending-push-store.js";
 import { RuntimeOverrideStore } from "../store/runtime-overrides.js";
 import { SessionTargetStore } from "../store/session-targets.js";
+import { XiaozhiBridgeClient } from "./rpc-client.js";
+import { XiaozhiSessionRuntime } from "./session-runtime.js";
 
-const RECONNECT_MIN_MS = 1000;
-const RECONNECT_MAX_MS = 15000;
-const RECONNECT_STABLE_MS = 60000;
-const RECONNECT_JITTER_RATIO = 0.2;
-const REQUEST_TIMEOUT_MS = 30000;
-const XIAOZHI_CHANNEL_ID = "xiaozhi";
-const SUPPORTED_METHODS = new Set([
-  "xiaozhi.sessionStarted",
-  "xiaozhi.sessionEnded",
-  "xiaozhi.chat",
-  "xiaozhi.bindPeerAgent",
-  "xiaozhi.inventory",
-  "xiaozhi.clearPeerSession",
-  "xiaozhi.debugSessionGet"
-]);
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function applyReconnectJitter(delayMs) {
-  const jitterWindow = Math.max(250, Math.round(delayMs * RECONNECT_JITTER_RATIO));
-  const offset = Math.floor(Math.random() * (jitterWindow * 2 + 1)) - jitterWindow;
-  return Math.max(RECONNECT_MIN_MS, delayMs + offset);
-}
-
-function buildBridgeUrl(serverUrl, bridgeToken) {
-  const url = new URL(serverUrl);
-  if (!url.searchParams.get("token") && bridgeToken) {
-    url.searchParams.set("token", bridgeToken);
-  }
-  return url.toString();
-}
-
-function normalizeError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return {
-    code: -32000,
-    message
-  };
-}
-
-function accountLogLabel(accountId, bridgeId) {
-  return `account=${accountId} bridge=${bridgeId || "unknown"}`;
-}
-
-class XiaozhiBridgeClient {
-  constructor({ api, accountId, accountConfig, router }) {
-    this.api = api;
-    this.accountId = accountId;
-    this.accountConfig = accountConfig;
-    this.router = router;
-    this.stopped = false;
-    this.runTask = null;
-    this.socket = null;
-    this.nextRequestId = 1;
-    this.pendingResults = new Map();
-  }
-
-  async start() {
-    if (this.runTask) {
-      return;
-    }
-    this.stopped = false;
-    this.runTask = this.runLoop();
-  }
-
-  async stop() {
-    this.stopped = true;
-    if (this.socket) {
-      this.socket.close();
-    }
-    if (this.runTask) {
-      await this.runTask;
-      this.runTask = null;
-    }
-  }
-
-  async runLoop() {
-    let delayMs = RECONNECT_MIN_MS;
-    while (!this.stopped) {
-      let session = null;
-      try {
-        session = await this.connectOnce();
-        if (this.isStableSession(session)) {
-          delayMs = RECONNECT_MIN_MS;
-        }
-      } catch (error) {
-        this.api.logger.error(
-          `[xiaozhi] bridge loop error ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}: ${normalizeError(error).message}`
-        );
-      }
-      if (!this.stopped) {
-        const nextDelayMs = this.getNextReconnectDelay(delayMs, session);
-        await sleep(applyReconnectJitter(nextDelayMs));
-        delayMs = nextDelayMs;
-      }
-    }
-  }
-
-  async connectOnce() {
-    const url = buildBridgeUrl(
-      this.accountConfig.serverUrl,
-      this.accountConfig.bridgeToken
-    );
-    return await new Promise((resolve) => {
-      let openedAt = 0;
-      const socket = new WebSocket(url, {
-        headers: this.accountConfig.bridgeToken
-          ? { Authorization: `Bearer ${this.accountConfig.bridgeToken}` }
-          : {}
-      });
-      this.socket = socket;
-
-      socket.on("open", () => {
-        openedAt = Date.now();
-        this.api.logger.info(
-          `[xiaozhi] bridge connected ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}`
-        );
-      });
-
-      socket.on("message", async (data) => {
-        try {
-          const payload = JSON.parse(data.toString());
-          await this.handlePayload(payload);
-        } catch (error) {
-          this.api.logger.error(
-            `[xiaozhi] invalid payload ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}: ${normalizeError(error).message}`
-          );
-        }
-      });
-
-      socket.on("error", (error) => {
-        this.api.logger.error(
-          `[xiaozhi] websocket error ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}: ${normalizeError(error).message}`
-        );
-      });
-
-      socket.on("close", (code, reason) => {
-        const closedAt = Date.now();
-        this.api.logger.warn(
-          `[xiaozhi] bridge closed ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)} code=${code} reason=${reason.toString()}`
-        );
-        const error = new Error(
-          `xiaozhi bridge disconnected: ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)}`
-        );
-        for (const pending of this.pendingResults.values()) {
-          pending.reject(error);
-        }
-        this.pendingResults.clear();
-        this.socket = null;
-        resolve({
-          code,
-          reason: reason.toString(),
-          openedAt,
-          closedAt
-        });
-      });
-    });
-  }
-
-  isStableSession(session) {
-    if (!session || !session.openedAt || !session.closedAt) {
-      return false;
-    }
-    return session.closedAt - session.openedAt >= RECONNECT_STABLE_MS;
-  }
-
-  getNextReconnectDelay(currentDelayMs, session) {
-    if (this.isStableSession(session)) {
-      return RECONNECT_MIN_MS;
-    }
-    return Math.min(
-      Math.max(currentDelayMs * 2, RECONNECT_MIN_MS),
-      RECONNECT_MAX_MS
-    );
-  }
-
-  async handlePayload(payload) {
-    if (!payload || typeof payload !== "object") {
-      return;
-    }
-    if (payload.id !== undefined && ("result" in payload || "error" in payload)) {
-      this.handleResult(payload);
-      return;
-    }
-    const method = payload.method;
-    const id = payload.id;
-    if (!SUPPORTED_METHODS.has(method)) {
-      if (id !== undefined) {
-        this.send({
-          jsonrpc: "2.0",
-          id,
-          error: {
-            code: -32601,
-            message: `Unsupported method: ${String(method)}`
-          }
-        });
-      }
-      return;
-    }
-
-    const params = {
-      ...(payload.params ?? {}),
-      account: payload?.params?.account || this.accountId
-    };
-
-    try {
-      if (method === "xiaozhi.chat") {
-        this.api.logger.info(
-          `[xiaozhi] inbound chat account=${params.account} peer=${params.peerId || "unknown"} textLength=${String(params.text || "").length}`
-        );
-      } else if (method === "xiaozhi.bindPeerAgent") {
-        this.api.logger.info(
-          `[xiaozhi] bind peer account=${params.account} peer=${params.peerId || "unknown"} agent=${params.agentId || "unknown"}`
-        );
-      }
-
-      let result = { ok: true };
-      if (method === "xiaozhi.sessionStarted") {
-        result = await this.router.onSessionStarted(params);
-      } else if (method === "xiaozhi.sessionEnded") {
-        result = await this.router.onSessionEnded(params);
-      } else if (method === "xiaozhi.chat") {
-        result = await this.router.routeChat(params);
-      } else if (method === "xiaozhi.bindPeerAgent") {
-        result = await this.router.bindPeerAgent(params);
-      } else if (method === "xiaozhi.inventory") {
-        result = await this.router.getInventory(params);
-      } else if (method === "xiaozhi.clearPeerSession") {
-        result = await this.router.clearPeerSession(params);
-      } else if (method === "xiaozhi.debugSessionGet") {
-        result = await this.router.getDebugSession(params);
-      }
-
-      if (id !== undefined) {
-        this.send({
-          jsonrpc: "2.0",
-          id,
-          result
-        });
-      }
-    } catch (error) {
-      this.api.logger.error(
-        `[xiaozhi] rpc failed ${accountLogLabel(this.accountId, this.accountConfig.bridgeId)} method=${method}: ${normalizeError(error).message}`
-      );
-      if (id !== undefined) {
-        this.send({
-          jsonrpc: "2.0",
-          id,
-          error: normalizeError(error)
-        });
-      }
-    }
-  }
-
-  send(payload) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      return;
-    }
-    this.socket.send(JSON.stringify(payload));
-  }
-
-  async callServer(method, params, timeoutMs = REQUEST_TIMEOUT_MS) {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      throw new Error("xiaozhi bridge is not connected");
-    }
-
-    const id = this.nextRequestId++;
-    const pending = {};
-    const promise = new Promise((resolve, reject) => {
-      pending.resolve = resolve;
-      pending.reject = reject;
-      pending.timer = setTimeout(() => {
-        this.pendingResults.delete(id);
-        reject(new Error(`xiaozhi rpc timeout: ${method}`));
-      }, timeoutMs);
-    });
-
-    this.pendingResults.set(id, pending);
-    this.send({
-      jsonrpc: "2.0",
-      id,
-      method,
-      params: params ?? {}
-    });
-    return await promise;
-  }
-
-  handleResult(payload) {
-    const pending = this.pendingResults.get(payload.id);
-    if (!pending) {
-      return;
-    }
-    this.pendingResults.delete(payload.id);
-    clearTimeout(pending.timer);
-
-    if (payload.error) {
-      const message =
-        typeof payload.error?.message === "string"
-          ? payload.error.message
-          : String(payload.error);
-      pending.reject(new Error(message));
-      return;
-    }
-
-    pending.resolve(payload.result);
-  }
-}
+const PENDING_PUSH_POLL_MS = 1500;
 
 export class XiaozhiBridgeService {
   constructor(api) {
@@ -321,16 +14,31 @@ export class XiaozhiBridgeService {
     this.overrides = new RuntimeOverrideStore();
     this.sessionTargets = new SessionTargetStore();
     this.debugTraceStore = new DebugTraceStore();
-    this.replyState = new Map();
-    this.router = new XiaozhiAgentRouter(api, this.overrides, this.sessionTargets, this.debugTraceStore, {
-      onRouteStart: (route) => {
-        this.markRouteStart(route);
-      },
-      onRouteSettled: (route, text) => {
-        this.markRouteSettled(route, text);
-      }
+    this.pendingPushStore = new PendingPushStore();
+    this.sessionRuntime = new XiaozhiSessionRuntime({
+      api,
+      sessionTargets: this.sessionTargets,
+      debugTraceStore: this.debugTraceStore,
+      pushText: (params, ctx) => this.pushText(params, ctx),
+      syncAsyncWaiting: (params, ctx) => this.syncAsyncWaiting(params, ctx)
     });
+    this.router = new XiaozhiAgentRouter(
+      api,
+      this.overrides,
+      this.sessionTargets,
+      this.debugTraceStore,
+      {
+        onRouteStart: (route) => {
+          this.sessionRuntime.markRouteStart(route);
+        },
+        onRouteSettled: (route, text) => {
+          this.sessionRuntime.markRouteSettled(route, text);
+        }
+      }
+    );
     this.clients = new Map();
+    this.pendingPushTimer = null;
+    this.pendingPushRunning = false;
   }
 
   async start() {
@@ -356,9 +64,14 @@ export class XiaozhiBridgeService {
       this.clients.set(accountId, client);
       await client.start();
     }
+    this.startPendingPushWorker();
   }
 
   async stop() {
+    if (this.pendingPushTimer) {
+      clearInterval(this.pendingPushTimer);
+      this.pendingPushTimer = null;
+    }
     const clients = [...this.clients.values()];
     this.clients.clear();
     for (const client of clients) {
@@ -366,8 +79,92 @@ export class XiaozhiBridgeService {
     }
     this.overrides.clear();
     this.sessionTargets.clear();
-    this.replyState.clear();
+    this.sessionRuntime.clear();
     this.debugTraceStore.clear();
+  }
+
+  startPendingPushWorker() {
+    if (this.pendingPushTimer) {
+      return;
+    }
+    this.pendingPushTimer = setInterval(() => {
+      this.drainPendingPushes().catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.api.logger.error(`[xiaozhi] pending push drain failed: ${message}`);
+      });
+    }, PENDING_PUSH_POLL_MS);
+    this.drainPendingPushes().catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.api.logger.error(`[xiaozhi] initial pending push drain failed: ${message}`);
+    });
+  }
+
+  async drainPendingPushes() {
+    if (this.pendingPushRunning) {
+      return;
+    }
+    this.pendingPushRunning = true;
+    try {
+      const queuedEntries = this.pendingPushStore.list();
+      for (const entry of queuedEntries) {
+        try {
+          await this.dispatchPushText(
+            {
+              account: entry.account,
+              sessionId: entry.sessionId,
+              deviceId: entry.deviceId,
+              peerId: entry.peerId,
+              text: entry.text
+            },
+            {
+              sessionKey: entry.sessionKey,
+              agentAccountId: entry.account,
+              requesterSenderId: entry.peerId,
+              debugSessionId: entry.debugSessionId
+            },
+            false
+          );
+          this.pendingPushStore.remove(entry.id);
+          await this.syncAsyncWaiting(
+            {
+              account: entry.account,
+              sessionId: entry.sessionId,
+              deviceId: entry.deviceId,
+              peerId: entry.peerId,
+              enabled: false,
+              source: "pending-push-delivered",
+              reason: "async-reply-delivered"
+            },
+            {
+              sessionKey: entry.sessionKey,
+              agentAccountId: entry.account,
+              requesterSenderId: entry.peerId,
+              debugSessionId: entry.debugSessionId
+            }
+          );
+          if (entry.debugSessionId) {
+            this.debugTraceStore.recordDevicePushSucceeded(entry.debugSessionId, {
+              sessionId: entry.sessionId,
+              deviceId: entry.deviceId,
+              peerId: entry.peerId,
+              message: "结果已推送到当前设备。"
+            });
+            this.debugTraceStore.finishIfPending(entry.debugSessionId);
+          }
+          this.api.logger.info(
+            `[xiaozhi] flushed queued push account=${entry.account} peer=${entry.peerId || ""} session=${entry.sessionId || ""}`
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.pendingPushStore.markAttempt(entry.id, message);
+          this.api.logger.warn(
+            `[xiaozhi] queued push retry failed account=${entry.account} peer=${entry.peerId || ""}: ${message}`
+          );
+        }
+      }
+    } finally {
+      this.pendingPushRunning = false;
+    }
   }
 
   createPushTextTool(ctx) {
@@ -413,10 +210,146 @@ export class XiaozhiBridgeService {
       throw new Error("text required");
     }
 
+    return await this.dispatchPushText(params, ctx, true);
+  }
+
+  async setAsyncWaiting(params, ctx = {}) {
+    const enabled = Boolean(params?.enabled);
+    const source =
+      typeof params?.source === "string" ? params.source.trim() : "";
+    const reason =
+      typeof params?.reason === "string" ? params.reason.trim() : "";
+
+    let target = null;
+    try {
+      target = this.resolvePushTarget(params, ctx);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.api.logger.warn(
+        `[xiaozhi] skip async waiting sync enabled=${enabled ? "yes" : "no"} source=${source || "-"}: ${message}`
+      );
+      return {
+        ok: false,
+        skipped: true,
+        reason: "missing-target",
+        enabled
+      };
+    }
+
+    const accountId = target.account || "default";
+    const client = this.resolveClient(accountId);
+    if (!client) {
+      this.api.logger.warn(
+        `[xiaozhi] skip async waiting sync enabled=${enabled ? "yes" : "no"} account=${accountId} source=${source || "-"}: bridge client unavailable`
+      );
+      return {
+        ok: false,
+        skipped: true,
+        reason: "client-unavailable",
+        enabled,
+        ...target
+      };
+    }
+
+    const method =
+      client.accountConfig?.setAsyncWaitingMethod || "xiaozhi.setAsyncWaiting";
+    this.api.logger.info(
+      `[xiaozhi] sync async waiting account=${accountId} enabled=${enabled ? "yes" : "no"} session=${target.sessionId || ""} device=${target.deviceId || ""} peer=${target.peerId || ""} source=${source || "-"}`
+    );
+    const result = await client.callServer(method, {
+      account: accountId,
+      sessionId: target.sessionId,
+      deviceId: target.deviceId,
+      peerId: target.peerId,
+      enabled,
+      source,
+      reason
+    });
+    return {
+      ok: true,
+      enabled,
+      ...target,
+      result
+    };
+  }
+
+  async syncAsyncWaiting(params, ctx = {}) {
+    const sessionKey =
+      typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "";
+    const state = this.sessionRuntime.ensureReplyState(sessionKey);
+    const enabled = Boolean(params?.enabled);
+    if (state) {
+      if (enabled && state.waitingSignalSent) {
+        return {
+          ok: true,
+          skipped: true,
+          reason: "already-synced",
+          enabled
+        };
+      }
+      if (!enabled && !state.waitingSignalSent) {
+        return {
+          ok: true,
+          skipped: true,
+          reason: "already-cleared",
+          enabled
+        };
+      }
+    }
+
+    try {
+      const result = await this.setAsyncWaiting(params, ctx);
+      if (state && result?.ok && !result?.skipped) {
+        state.waitingSignalSent = enabled;
+      }
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.api.logger.warn(
+        `[xiaozhi] async waiting sync failed source=${params?.source || "-"}: ${message}`
+      );
+      return {
+        ok: false,
+        skipped: true,
+        reason: "sync-failed",
+        enabled,
+        message
+      };
+    }
+  }
+
+  async dispatchPushText(params, ctx = {}, allowQueue = true) {
+    const text = typeof params?.text === "string" ? params.text.trim() : "";
+    if (!text) {
+      throw new Error("text required");
+    }
     const target = this.resolvePushTarget(params, ctx);
     const accountId = target.account || "default";
     const client = this.resolveClient(accountId);
     if (!client) {
+      if (allowQueue) {
+        const queued = this.pendingPushStore.enqueue({
+          account: accountId,
+          sessionId: target.sessionId,
+          deviceId: target.deviceId,
+          peerId: target.peerId,
+          text,
+          sessionKey: typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "",
+          debugSessionId: typeof ctx?.debugSessionId === "string" ? ctx.debugSessionId.trim() : ""
+        });
+        if (!queued) {
+          throw new Error(`xiaozhi bridge client unavailable for account=${accountId}`);
+        }
+        this.api.logger.warn(
+          `[xiaozhi] bridge client unavailable, queued push account=${accountId} peer=${target.peerId || ""} session=${target.sessionId || ""}`
+        );
+        return {
+          ok: true,
+          queued: true,
+          queueId: queued.id,
+          ...target
+        };
+      }
       throw new Error(`xiaozhi bridge client unavailable for account=${accountId}`);
     }
 
@@ -434,6 +367,7 @@ export class XiaozhiBridgeService {
     });
     return {
       ok: true,
+      queued: false,
       ...target,
       result
     };
@@ -497,719 +431,23 @@ export class XiaozhiBridgeService {
     return this.clients.get("default") ?? null;
   }
 
-  getRouteKeys(routeOrSessionKey) {
-    if (typeof routeOrSessionKey === "string") {
-      return routeOrSessionKey.trim() ? [routeOrSessionKey.trim()] : [];
-    }
-
-    const keys = new Set();
-    const sessionKey =
-      typeof routeOrSessionKey?.sessionKey === "string"
-        ? routeOrSessionKey.sessionKey.trim()
-        : "";
-    const mainSessionKey =
-      typeof routeOrSessionKey?.mainSessionKey === "string"
-        ? routeOrSessionKey.mainSessionKey.trim()
-        : "";
-    if (sessionKey) {
-      keys.add(sessionKey);
-    }
-    if (mainSessionKey) {
-      keys.add(mainSessionKey);
-    }
-    return [...keys];
-  }
-
-  ensureReplyState(sessionKey) {
-    const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
-    if (!key) {
-      return null;
-    }
-    const current =
-      this.replyState.get(key) ??
-      {
-        isRouteRoot: false,
-        activeSyncRuns: 0,
-        awaitingChildResult: false,
-        lastImmediateText: "",
-        lastPushedText: ""
-      };
-    this.replyState.set(key, current);
-    return current;
-  }
-
-  markRouteStart(route) {
-    for (const sessionKey of this.getRouteKeys(route)) {
-      const state = this.ensureReplyState(sessionKey);
-      if (!state) {
-        continue;
-      }
-      state.isRouteRoot = true;
-      state.activeSyncRuns += 1;
-    }
-  }
-
-  markRouteSettled(route, text = "") {
-    const normalizedText = this.normalizePushText(text);
-    const handledDebugSessions = new Set();
-    for (const sessionKey of this.getRouteKeys(route)) {
-      const state = this.ensureReplyState(sessionKey);
-      if (!state) {
-        continue;
-      }
-      state.activeSyncRuns = Math.max(0, state.activeSyncRuns - 1);
-      if (normalizedText) {
-        state.lastImmediateText = normalizedText;
-      }
-      const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
-      if (!debugSessionId || handledDebugSessions.has(debugSessionId) || !normalizedText) {
-        continue;
-      }
-      handledDebugSessions.add(debugSessionId);
-      this.api.logger.info(
-        `[xiaozhi][debug] route settled session=${sessionKey} debug=${debugSessionId} text=${JSON.stringify(normalizedText.slice(0, 120))}`
-      );
-      this.debugTraceStore.recordProgress(debugSessionId, {
-        sessionKey,
-        agentId: route?.agentId || "",
-        agentName: route?.agentName || route?.agentId || "",
-        message: normalizedText
-      });
-    }
-  }
-
-  async finalizeDebugRoute({ debugSessionId, sessionKey, finalText, state }) {
-    this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
-    if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
-      this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
-    }
-
-    const shouldPushToDevice = this.debugTraceStore.shouldPushToDevice(debugSessionId);
-    if (!shouldPushToDevice) {
-      this.debugTraceStore.finishIfPending(debugSessionId);
-      return;
-    }
-
-    const target = this.sessionTargets.get(sessionKey);
-    if (!target) {
-      this.debugTraceStore.recordDevicePushFailed(
-        debugSessionId,
-        "未找到当前调试会话对应的设备上下文。"
-      );
-      this.debugTraceStore.finishIfPending(debugSessionId);
-      return;
-    }
-
-    this.debugTraceStore.recordDevicePushStarted(debugSessionId);
-    try {
-      await this.pushText(
-        {
-          account: target.account,
-          sessionId: target.sessionId,
-          deviceId: target.deviceId,
-          peerId: target.peerId,
-          text: finalText
-        },
-        {
-          sessionKey,
-          agentAccountId: target.account,
-          requesterSenderId: target.peerId
-        }
-      );
-      if (state) {
-        state.lastPushedText = finalText;
-      }
-      this.debugTraceStore.recordDevicePushSucceeded(debugSessionId, {
-        sessionId: target.sessionId,
-        deviceId: target.deviceId,
-        peerId: target.peerId,
-        message: "结果已推送到当前设备。"
-      });
-      this.debugTraceStore.finishIfPending(debugSessionId);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.debugTraceStore.recordDevicePushFailed(debugSessionId, message);
-      this.debugTraceStore.finishIfPending(debugSessionId);
-      throw error;
-    }
-  }
-
-  async handleAgentEnded(event, ctx = {}) {
-    const sessionKey =
-      typeof ctx?.sessionKey === "string" ? ctx.sessionKey.trim() : "";
-    if (!sessionKey) {
-      return;
-    }
-
-    const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(sessionKey);
-    const inferredRootSession = !sessionKey.includes(":subagent:");
-    const state = debugSessionId
-      ? (this.ensureReplyState(sessionKey) ?? null)
-      : (this.replyState.get(sessionKey) ?? null);
-    if (state && inferredRootSession) {
-      state.isRouteRoot = true;
-    }
-
-    const channelId =
-      typeof ctx?.channelId === "string" ? ctx.channelId.trim() : "";
-    const messageProvider =
-      typeof ctx?.messageProvider === "string" ? ctx.messageProvider.trim() : "";
-    if (
-      !debugSessionId &&
-      channelId !== XIAOZHI_CHANNEL_ID &&
-      messageProvider !== XIAOZHI_CHANNEL_ID
-    ) {
-      return;
-    }
-
-    const target = this.sessionTargets.get(sessionKey);
-    const childSessionKeys = this.extractSpawnedChildSessionKeys(event?.messages);
-    const hasChildCompletionEvent = this.hasChildCompletionEvent(event?.messages);
-    if (debugSessionId) {
-      this.api.logger.info(
-        `[xiaozhi][debug] agent_end session=${sessionKey} debug=${debugSessionId} root=${state?.isRouteRoot ? "yes" : "no"} inferredRoot=${inferredRootSession ? "yes" : "no"} children=${childSessionKeys.length} childDone=${hasChildCompletionEvent ? "yes" : "no"} channel=${channelId || "-"} provider=${messageProvider || "-"}`
-      );
-    }
-    if (debugSessionId && state?.isRouteRoot && childSessionKeys.length > 0) {
-      state.awaitingChildResult = true;
-      for (const childSessionKey of childSessionKeys) {
-        this.sessionTargets.inherit(sessionKey, childSessionKey);
-        const inheritedDebugSessionId = this.debugTraceStore.inherit(sessionKey, childSessionKey);
-        if (inheritedDebugSessionId) {
-          this.debugTraceStore.recordSubagentSpawned(inheritedDebugSessionId, {
-            sessionKey: childSessionKey,
-            message: childSessionKey
-          });
-          const record = this.debugTraceStore.ensureSession({ debugSessionId: inheritedDebugSessionId });
-          if (record) {
-            record.pending = true;
-            record.status = "running";
-            record.updatedAt = Date.now();
-          }
-        }
-      }
-    }
-    if (debugSessionId && state?.isRouteRoot && childSessionKeys.length > 0 && !hasChildCompletionEvent) {
-      return;
-    }
-    if (!state?.isRouteRoot) {
-      if (debugSessionId) {
-        const finalText = this.normalizePushText(
-          this.extractFinalAssistantText(event?.messages)
-        );
-        this.debugTraceStore.recordSubagentCompleted(debugSessionId, {
-          sessionKey,
-          agentId: this.resolveAgentId(event, ctx),
-          agentName: this.resolveAgentName(event, ctx),
-          summary: finalText || "子任务执行完成"
-        });
-      }
-      return;
-    }
-
-    if (state?.activeSyncRuns > 0 && !debugSessionId) {
-      this.api.logger.info(
-        `[xiaozhi] skip auto-push for active sync run session=${sessionKey}`
-      );
-      return;
-    }
-
-    const finalText = this.normalizePushText(
-      this.extractFinalAssistantText(event?.messages)
-    );
-    if (!finalText || finalText === "NO_REPLY") {
-      if (debugSessionId) {
-        if (state?.awaitingChildResult || state?.lastImmediateText) {
-          this.api.logger.info(
-            `[xiaozhi] keep debug session pending after NO_REPLY session=${sessionKey}`
-          );
-          return;
-        }
-        this.debugTraceStore.finishIfPending(debugSessionId);
-      }
-      return;
-    }
-
-    if (state) {
-      state.awaitingChildResult = false;
-    }
-    if (debugSessionId) {
-      this.debugTraceStore.recordReplyReady(debugSessionId, finalText);
-      if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
-        this.debugTraceStore.recordBrowserAudioReady(debugSessionId, finalText);
-      }
-    }
-
-    if (
-      finalText === state?.lastImmediateText ||
-      finalText === state?.lastPushedText
-    ) {
-      if (debugSessionId) {
-        this.debugTraceStore.finishIfPending(debugSessionId);
-      }
-      this.api.logger.info(
-        `[xiaozhi] skip duplicate auto-push session=${sessionKey}`
-      );
-      return;
-    }
-
-    if (!target) {
-      if (debugSessionId) {
-        this.debugTraceStore.finishIfPending(debugSessionId);
-      }
-      return;
-    }
-
-    const shouldPushToDevice =
-      !debugSessionId || this.debugTraceStore.shouldPushToDevice(debugSessionId);
-    if (!shouldPushToDevice) {
-      this.debugTraceStore.finishIfPending(debugSessionId);
-      return;
-    }
-
-    if (debugSessionId) {
-      this.debugTraceStore.recordDevicePushStarted(debugSessionId);
-    }
-    try {
-      await this.pushText(
-        {
-          account: target.account,
-          sessionId: target.sessionId,
-          deviceId: target.deviceId,
-          peerId: target.peerId,
-          text: finalText
-        },
-        {
-          sessionKey,
-          agentAccountId: target.account,
-          requesterSenderId: target.peerId
-        }
-      );
-      if (state) {
-        state.lastPushedText = finalText;
-      }
-      if (debugSessionId) {
-        this.debugTraceStore.recordDevicePushSucceeded(debugSessionId, {
-          sessionId: target.sessionId,
-          deviceId: target.deviceId,
-          peerId: target.peerId,
-          message: "结果已推送到当前设备。"
-        });
-        this.debugTraceStore.finishIfPending(debugSessionId);
-      }
-      this.api.logger.info(
-        `[xiaozhi] auto-pushed async reply session=${sessionKey} peer=${target.peerId || ""}`
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (debugSessionId) {
-        this.debugTraceStore.recordDevicePushFailed(debugSessionId, message);
-        this.debugTraceStore.finishIfPending(debugSessionId);
-      }
-      this.api.logger.error(
-        `[xiaozhi] auto-push failed session=${sessionKey}: ${message}`
-      );
-    }
-  }
-
-  extractFinalAssistantText(messages) {
-    if (!Array.isArray(messages)) {
-      return "";
-    }
-
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const candidate = this.extractAssistantMessageText(messages[index]);
-      if (candidate) {
-        return candidate;
-      }
-    }
-    return "";
-  }
-
-  extractAssistantMessageText(entry) {
-    const message =
-      entry && typeof entry === "object" && entry.message && typeof entry.message === "object"
-        ? entry.message
-        : entry;
-    if (!message || typeof message !== "object") {
-      return "";
-    }
-    if (message.role !== "assistant") {
-      return "";
-    }
-    return this.extractRichText(message.content ?? message.text ?? message);
-  }
-
-  extractRichText(value) {
-    if (!value) {
-      return "";
-    }
-    if (typeof value === "string") {
-      return value.trim();
-    }
-    if (Array.isArray(value)) {
-      return value
-        .map((item) => this.extractRichText(item))
-        .filter(Boolean)
-        .join("\n")
-        .trim();
-    }
-    if (typeof value !== "object") {
-      return String(value).trim();
-    }
-
-    if (value.type === "text" && typeof value.text === "string") {
-      return value.text.trim();
-    }
-
-    const directKeys = ["text", "content", "message", "payload", "result"];
-    for (const key of directKeys) {
-      const candidate = this.extractRichText(value[key]);
-      if (candidate) {
-        return candidate;
-      }
-    }
-
-    return "";
-  }
-
-  normalizePushText(text) {
-    const input = typeof text === "string" ? text : "";
-    return input
-      .replace(/\[\[reply_to_current\]\]\s*/g, "")
-      .replace(/^MEDIA:\s+.*$/gmu, "")
-      .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, "$1")
-      .replace(/\*\*([^*]+)\*\*/g, "$1")
-      .replace(/`([^`]+)`/g, "$1")
-      .replace(/^#{1,6}\s+/gmu, "")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-  }
-
-  hasChildCompletionEvent(messages) {
-    if (!Array.isArray(messages)) {
-      return false;
-    }
-    return messages.some((entry) => {
-      const message =
-        entry && typeof entry === "object" && entry.message && typeof entry.message === "object"
-          ? entry.message
-          : entry;
-      if (!message || typeof message !== "object") {
-        return false;
-      }
-      const provenance = message.provenance;
-      if (provenance && provenance.kind === "inter_session") {
-        return true;
-      }
-      const text = this.extractRichText(message.content ?? message.text ?? "");
-      return text.includes("[Internal task completion event]");
-    });
-  }
-
-  resolveDebugSessionIdFromPeer(peerId) {
-    const normalizedPeerId = typeof peerId === "string" ? peerId.trim() : "";
-    if (!normalizedPeerId.startsWith("web-debug:")) {
-      return "";
-    }
-    return normalizedPeerId.slice("web-debug:".length).trim();
-  }
-
-  captureDebugOutboundResult(params = {}) {
-    const peerId = typeof params?.to === "string" ? params.to.trim() : "";
-    const debugSessionId = this.resolveDebugSessionIdFromPeer(peerId);
-    if (!debugSessionId) {
-      return null;
-    }
-
-    const accountId =
-      typeof params?.accountId === "string" && params.accountId.trim()
-        ? params.accountId.trim()
-        : "default";
-    const text = this.normalizePushText(
-      params?.text || params?.message || params?.caption || ""
-    );
-    const mediaItems = Array.isArray(params?.mediaItems)
-      ? params.mediaItems.filter(Boolean)
-      : [];
-
-    this.debugTraceStore.ensureSession({
-      debugSessionId,
-      account: accountId,
-      peerId
-    });
-
-    if (text) {
-      this.debugTraceStore.recordReplyReady(debugSessionId, text);
-      if (this.debugTraceStore.shouldPrepareBrowserAudio(debugSessionId)) {
-        this.debugTraceStore.recordBrowserAudioReady(debugSessionId, text);
-      }
-    } else if (mediaItems.length > 0) {
-      this.debugTraceStore.append(debugSessionId, {
-        type: "media_result_ready",
-        title: "结果附件已生成",
-        message: `当前结果包含 ${mediaItems.length} 个附件，调试面板暂只展示文字摘要。`
-      });
-    }
-
-    this.debugTraceStore.finishIfPending(debugSessionId);
-    return {
-      ok: true,
-      captured: true,
-      debugSessionId,
-      reason: "debug-session",
-      mediaCount: mediaItems.length
-    };
-  }
-
   async sendOutboundText(params = {}) {
-    const text = typeof params?.text === "string" ? params.text.trim() : "";
-    const peerId = typeof params?.to === "string" ? params.to.trim() : "";
-    const accountId =
-      typeof params?.accountId === "string" && params.accountId.trim()
-        ? params.accountId.trim()
-        : "default";
-
-    if (!text) {
-      return { ok: true, skipped: true, reason: "empty-text" };
-    }
-    if (!peerId) {
-      return { ok: true, skipped: true, reason: "missing-peer" };
-    }
-
-    const debugCapture = this.captureDebugOutboundResult({
-      ...params,
-      accountId,
-      to: peerId,
-      text
-    });
-    if (debugCapture) {
-      return debugCapture;
-    }
-
-    return await this.pushText(
-      {
-        account: accountId,
-        peerId,
-        text
-      },
-      {
-        agentAccountId: accountId,
-        requesterSenderId: peerId
-      }
-    );
+    return await this.sessionRuntime.sendOutboundText(params);
   }
 
   async sendOutboundMedia(params = {}) {
-    const peerId = typeof params?.to === "string" ? params.to.trim() : "";
-    const accountId =
-      typeof params?.accountId === "string" && params.accountId.trim()
-        ? params.accountId.trim()
-        : "default";
-    const text = this.normalizePushText(
-      params?.text || params?.message || params?.caption || ""
-    );
-    const mediaItems = Array.isArray(params?.mediaItems)
-      ? params.mediaItems.filter(Boolean)
-      : [];
+    return await this.sessionRuntime.sendOutboundMedia(params);
+  }
 
-    const debugCapture = this.captureDebugOutboundResult({
-      ...params,
-      accountId,
-      to: peerId,
-      text,
-      mediaItems
-    });
-    if (debugCapture) {
-      return debugCapture;
-    }
-
-    if (text) {
-      return await this.sendOutboundText({
-        ...params,
-        accountId,
-        to: peerId,
-        text
-      });
-    }
-
-    return {
-      ok: true,
-      skipped: true,
-      reason: "media-unsupported",
-      mediaDropped: mediaItems.length > 0
-    };
+  async handleAgentEnded(event, ctx = {}) {
+    await this.sessionRuntime.handleAgentEnded(event, ctx);
   }
 
   handleSubagentSpawned(event, ctx = {}) {
-    const sourceCandidates = [
-      ctx?.requesterSessionKey,
-      event?.requesterSessionKey,
-      ctx?.requesterMainSessionKey,
-      event?.requesterMainSessionKey,
-      ctx?.mainSessionKey,
-      event?.mainSessionKey
-    ]
-      .filter((value) => typeof value === "string" && value.trim())
-      .map((value) => value.trim());
-    const sourceSessionKey = sourceCandidates[0] || "";
-    const childSessionKey = ctx?.childSessionKey || event?.childSessionKey;
-    const sourceState = this.ensureReplyState(sourceSessionKey);
-    if (sourceState) {
-      sourceState.awaitingChildResult = true;
-    }
-    const sourceHasTarget = Boolean(this.sessionTargets.get(sourceSessionKey));
-    const sourceHasDebug = this.debugTraceStore.hasSessionKey(sourceSessionKey);
-    const inherited = this.sessionTargets.inherit(sourceSessionKey, childSessionKey);
-    const debugSessionId = this.debugTraceStore.inherit(sourceSessionKey, childSessionKey);
-    this.api.logger.info(
-      `[xiaozhi][debug] subagent_spawned sources=${JSON.stringify(sourceCandidates)} child=${childSessionKey || ""} debug=${debugSessionId || ""} inherited=${inherited ? "yes" : "no"} hasTarget=${sourceHasTarget ? "yes" : "no"} hasDebug=${sourceHasDebug ? "yes" : "no"} ctxKeys=${JSON.stringify(Object.keys(ctx || {}))} eventKeys=${JSON.stringify(Object.keys(event || {}))}`
-    );
-    if (debugSessionId) {
-      const record = this.debugTraceStore.ensureSession({ debugSessionId });
-      if (record) {
-        record.pending = true;
-        record.status = "running";
-        record.updatedAt = Date.now();
-      }
-      this.debugTraceStore.recordSubagentSpawned(debugSessionId, {
-        sessionKey: childSessionKey,
-        agentId: this.resolveChildAgentId(event, ctx),
-        agentName: this.resolveChildAgentName(event, ctx),
-        message:
-          this.resolveChildAgentName(event, ctx) ||
-          this.resolveChildAgentId(event, ctx) ||
-          childSessionKey ||
-          "后台任务已启动"
-      });
-    }
-    if (!inherited) {
-      return;
-    }
-    this.api.logger.info(
-      `[xiaozhi] inherited target requester=${sourceSessionKey || ""} child=${childSessionKey || ""} device=${inherited.deviceId || ""} peer=${inherited.peerId || ""}`
-    );
+    this.sessionRuntime.handleSubagentSpawned(event, ctx);
   }
 
   handleSessionEnded(ctx = {}) {
-    if (!ctx?.sessionKey) {
-      return;
-    }
-    const debugSessionId = this.debugTraceStore.getDebugSessionIdForSession(ctx.sessionKey);
-    const snapshot = debugSessionId
-      ? this.debugTraceStore.getSnapshot(debugSessionId)
-      : null;
-    if (debugSessionId && snapshot?.pending) {
-      this.api.logger.info(
-        `[xiaozhi][debug] preserve pending session on session_end session=${ctx.sessionKey} debug=${debugSessionId}`
-      );
-      return;
-    }
-    if (debugSessionId) {
-      this.api.logger.info(
-        `[xiaozhi][debug] session_end session=${ctx.sessionKey} debug=${debugSessionId}`
-      );
-    }
-    this.sessionTargets.delete(ctx.sessionKey);
-    this.replyState.delete(ctx.sessionKey);
-    this.debugTraceStore.clearSessionKeys(ctx.sessionKey);
-  }
-
-  resolveAgentId(event, ctx = {}) {
-    const candidates = [
-      ctx?.agentId,
-      ctx?.resolvedAgentId,
-      event?.agentId,
-      event?.resolvedAgentId
-    ];
-    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
-  }
-
-  resolveAgentName(event, ctx = {}) {
-    const candidates = [
-      ctx?.agentName,
-      ctx?.resolvedAgentName,
-      event?.agentName,
-      event?.resolvedAgentName
-    ];
-    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
-  }
-
-  resolveChildAgentId(event, ctx = {}) {
-    const candidates = [
-      ctx?.childAgentId,
-      event?.childAgentId,
-      ctx?.agentId,
-      event?.agentId
-    ];
-    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
-  }
-
-  resolveChildAgentName(event, ctx = {}) {
-    const candidates = [
-      ctx?.childAgentName,
-      event?.childAgentName,
-      ctx?.agentName,
-      event?.agentName
-    ];
-    return candidates.find((value) => typeof value === "string" && value.trim()) || "";
-  }
-
-  extractSpawnedChildSessionKeys(messages) {
-    const keys = new Set();
-    const visited = new Set();
-    const visit = (value) => {
-      if (!value) {
-        return;
-      }
-      if (typeof value === "string") {
-        try {
-          visit(JSON.parse(value));
-        } catch {
-          // ignore non-json string payloads
-        }
-        return;
-      }
-      if (typeof value !== "object") {
-        return;
-      }
-      if (visited.has(value)) {
-        return;
-      }
-      visited.add(value);
-
-      const directKey =
-        typeof value.childSessionKey === "string" ? value.childSessionKey.trim() : "";
-      if (directKey) {
-        keys.add(directKey);
-      }
-
-      const toolName =
-        typeof value.toolName === "string"
-          ? value.toolName
-          : (typeof value.name === "string" ? value.name : "");
-      if (toolName === "sessions_spawn") {
-        const detailsKey =
-          typeof value.details?.childSessionKey === "string"
-            ? value.details.childSessionKey.trim()
-            : "";
-        if (detailsKey) {
-          keys.add(detailsKey);
-        }
-      }
-
-      if (Array.isArray(value)) {
-        for (const item of value) {
-          visit(item);
-        }
-        return;
-      }
-
-      for (const item of Object.values(value)) {
-        visit(item);
-      }
-    };
-    visit(messages);
-    return [...keys];
+    this.sessionRuntime.handleSessionEnded(ctx);
   }
 }

@@ -5,7 +5,7 @@
   "packageManager": "pnpm@10.8.0",
   "scripts": {
     "prepare:publish": "node ./scripts/prepare-publish.mjs",
-    "check": "node --check ./packages/openclaw-xiaozhi/index.js && node --check ./packages/openclaw-xiaozhi/setup-entry.js && node --check ./packages/openclaw-xiaozhi/src/channel/xiaozhi-channel.js && node --check ./packages/openclaw-xiaozhi/src/store/static-bindings.js && node --check ./packages/openclaw-xiaozhi/src/store/runtime-overrides.js && node --check ./packages/openclaw-xiaozhi/src/store/session-targets.js && node --check ./packages/openclaw-xiaozhi/src/store/debug-trace-store.js && node --check ./packages/openclaw-xiaozhi/src/router/agent-router.js && node --check ./packages/openclaw-xiaozhi/src/bridge/client.js && node --check ./packages/openclaw-xiaozhi-cli/bin/openclaw-xiaozhi.js"
+    "check": "node --check ./packages/openclaw-xiaozhi/index.js && node --check ./packages/openclaw-xiaozhi/setup-entry.js && node --check ./packages/openclaw-xiaozhi/src/channel/xiaozhi-channel.js && node --check ./packages/openclaw-xiaozhi/src/store/static-bindings.js && node --check ./packages/openclaw-xiaozhi/src/store/runtime-overrides.js && node --check ./packages/openclaw-xiaozhi/src/store/session-targets.js && node --check ./packages/openclaw-xiaozhi/src/store/debug-trace-store.js && node --check ./packages/openclaw-xiaozhi/src/store/pending-push-store.js && node --check ./packages/openclaw-xiaozhi/src/router/agent-router.js && node --check ./packages/openclaw-xiaozhi/src/bridge/client.js && node --check ./packages/openclaw-xiaozhi-cli/bin/openclaw-xiaozhi.js"
   },
   "workspaces": [
     "packages/*"
